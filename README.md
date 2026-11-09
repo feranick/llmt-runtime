@@ -284,4 +284,5 @@ Each translator's tests use `llmt_runtime.testing.fake_slurm`. Their own fakes a
 
 | version | what changed and why |
 |---|---|
+| 2026.11.09.2 | `memory.threads_for_memory(..., own_mb=)`: the translator may give its own measure of its resident memory (feat measures itself, and its tests fix it at 0 to check the arithmetic); default as before, `own_rss_mb()`. Found moving feat onto the runtime (phase 1). Additive: floors at 2026.11.09.1 still hold. |
 | 2026.11.09.1 | First version. The workers, memory, SLURM, jobs, requests and server code of fea-translator 2026.11.09.5, merged with the better pieces of cfd-translator 2026.11.08.2, lammps-translator 2026.11.7.1 and openmodelica-translator 2026.11.07.1 (see "Inventory"), with the fixes listed above. Findings behind them: carbonio jobs 5797 and 5807 (out of memory taken for a crash; a kill of the whole batch step), the node's kills at 20.1 and 13.9 GB in 34 GB jobs, mochi job 3177 (SLURM refused a raise of a running job's limit), a 2026.11.09.2 bench that read 2026.11.09.3. The merged fake SLURM comes from the four translators' fakes. |

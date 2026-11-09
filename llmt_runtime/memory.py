@@ -1,5 +1,5 @@
 """memory.py — the memory a run may use, and whose memory ran out when a solver was killed.
-Version: 2026.11.09.1
+Version: 2026.11.09.2
 
     memory_limit_mb()          SLURM_MEM_PER_NODE, else the cgroup's memory.max (v2) / memory.limit_in_bytes (v1)
     oom_kills(), oom_limit_hits()  cgroup counters: kills by the OOM killer; times the cgroup reached its limit
@@ -22,6 +22,7 @@ far the job's largest process, so the job's own limit picks it anyway.
 """
 from __future__ import annotations
 
+import math
 import os
 import re
 import shutil
@@ -329,17 +330,20 @@ class OomWatch:
 
 def threads_for_memory(need_gb: Callable[[int], float], threads: int, limit_mb: float | None = None,
                        what: str = "this run", solver: str = "the solver",
-                       ask_gb: Callable[[float], int] | None = None) -> tuple[int, dict | None]:
+                       ask_gb: Callable[[float], int] | None = None,
+                       own_mb: float | None = None) -> tuple[int, dict | None]:
     """(threads, note) for a run whose memory need with t threads is need_gb(t) (GB, the translator's model): 1 thread
     when the threads asked for would not fit the job's memory (limit_mb, default memory_limit_mb()) less this
-    process's own; a note when even 1 may not fit. The size estimate before a run can be far off (carbonio job 5807:
-    107,171 nodes estimated, 424,303 meshed; 6 threads in 30 GB were killed after 7 min); check on the real size."""
+    process's own (own_mb, default own_rss_mb()); a note when even 1 may not fit. The size estimate before a run can be
+    far off (carbonio job 5807: 107,171 nodes estimated, 424,303 meshed; 6 threads in 30 GB were killed after 7 min);
+    check on the real size."""
     if limit_mb is None:
         limit_mb = memory_limit_mb()
     if not limit_mb or threads < 1:
         return threads, None
-    ask = ask_gb or (lambda gb: int(-(-(gb + 1) // 1)))
-    avail = limit_mb / 1024 - own_rss_mb() / 1024 - 0.5
+    ask = ask_gb or (lambda gb: int(math.ceil(gb + 1)))
+    own = own_rss_mb() if own_mb is None else float(own_mb)
+    avail = limit_mb / 1024 - own / 1024 - 0.5
     need = {t: float(need_gb(t)) for t in sorted({threads, 1})}
     note = {"threads_asked": threads, "limit_gb": round(limit_mb / 1024, 1), "available_gb": round(avail, 1),
             "estimate_gb": {str(k): round(v, 1) for k, v in need.items()}}

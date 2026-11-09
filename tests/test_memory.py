@@ -133,6 +133,15 @@ def test_threads_for_memory(monkeypatch):
     t, note = M.threads_for_memory(lambda n: 50.0, 1, 32768, what="it")
     assert t == 1 and note["message"].endswith("it may run out of memory: ask for 51G (run.mem)")
     assert M.threads_for_memory(need, 6, 65536) == (6, None)
+    t, note = M.threads_for_memory(need, 6, 32768, own_mb=0.0)       # the translator's own measure of itself
+    assert note["available_gb"] == 31.5
+
+
+def test_threads_for_memory_default_own(monkeypatch):
+    monkeypatch.setattr(M, "own_rss_mb", lambda: 2048.0)
+    assert M.threads_for_memory(lambda n: 1.0, 2, 8192)[0] == 2
+    t, note = M.threads_for_memory(lambda n: 7.0, 2, 8192)            # 8 GB - 2 GB - 0.5: 7 GB do not fit
+    assert t == 1 and note["available_gb"] == 5.5
 
 
 def test_exit_text_and_node_jobs(monkeypatch):
