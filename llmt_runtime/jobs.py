@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.09.1
+Version: 2026.11.09.3
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -318,8 +318,8 @@ def scancel(ids: list[str]) -> str | None:
 
 # ----------------------------------------------------------------------------- how a job ended
 
-def default_oom_advice(rt, folder: Path) -> str:
-    job = read_job(folder)
+def default_oom_advice(rt, folder: Path | None) -> str:
+    job = read_job(folder) if folder is not None else {}
     n, mem = int(job.get("procs") or 1), job.get("mem")
     unit = "thread" if rt.kind == "threads" else "rank"
     head = "SLURM killed the job for memory" + (f" ({mem} with {n} {unit}{'s' if n != 1 else ''})" if mem else "")
@@ -329,12 +329,23 @@ def default_oom_advice(rt, folder: Path) -> str:
 def ended_state(rt, acct: str | None, log: Path, job: dict | None = None, node: str | None = None) -> tuple[str, str]:
     """(state, why) of a job that left the queue without writing a result: sacct's state when there is accounting,
     else what SLURM wrote in job.log ('DUE TO TIME LIMIT', 'CANCELLED', out of memory: OOM_RE, whatever sacct says).
-    node: where the job ran (sacct, squeue), to tell a node that cannot see the run folder."""
-    a = (acct or "").upper()
+    node: where the job ran (sacct, squeue), to tell a node that cannot see the run folder. (classify_end on the
+    log's tail.)"""
     log = Path(log)
-    t = tail(log)
     folder = log.parent
-    job = job if job is not None else read_job(folder)
+    return classify_end(rt, acct, tail(log), has_log=log.is_file(), folder=folder,
+                        job=job if job is not None else read_job(folder), node=node)
+
+
+def classify_end(rt, acct: str | None, log_tail: str, has_log: bool = True, folder: Path | None = None,
+                 job: dict | None = None, node: str | None = None) -> tuple[str, str]:
+    """ended_state on the text of job.log's end (has_log False: there is no job.log). folder: the study folder, for
+    the out-of-memory advice (hooks.oom_advice) and messages; job: its job.json. A job with neither accounting nor
+    job.log never started (SLURM writes job.log when a job starts; a scancel while queued leaves nothing): cancelled
+    (cfd-translator's rule; feat called it failed)."""
+    a = (acct or "").upper()
+    t = log_tail or ""
+    job = job or {}
     if a.startswith(("TIMEOUT", "DEADLINE")) or (not a and "DUE TO TIME LIMIT" in t):
         why = (f"SLURM's time limit stopped it before {rt.cli}'s own timeout: raise {rt.var('TIMEOUT')} or the "
                f"study's run.timeout_s (it also sets the job's limit)" + (f" {rt.hooks.timeout_hint}"
@@ -345,23 +356,27 @@ def ended_state(rt, acct: str | None, log: Path, job: dict | None = None, node: 
         return "timed_out", why
     if a.startswith("OUT_OF_MEMORY") or OOM_RE.search(t):
         try:
-            adv = rt.hooks.oom_advice(folder) if rt.hooks.oom_advice else default_oom_advice(rt, folder)
+            adv = (rt.hooks.oom_advice(folder) if rt.hooks.oom_advice and folder is not None
+                   else default_oom_advice(rt, folder))
         except Exception:  # noqa: BLE001 (the state matters more than the advice)
             adv = default_oom_advice(rt, folder)
         return "out_of_memory", adv
     if a.startswith("CANCELLED") or (not a and "CANCELLED" in t):
         who = acct.split(" by ", 1)[1].strip() if acct and " by " in acct else None
         return "cancelled", "cancelled" + (f" by {who}" if who else "") + " (scancel or cancel())"
-    nodes = S.cluster_nodes() if (not log.is_file() and node) else None
+    nodes = S.cluster_nodes() if (not has_log and node) else None
     if nodes and len(nodes) > 1:
         me = S.this_node(nodes)
         if me is None or me.get("NodeName") != node:
-            return "failed", (f"the job went to node {node} and left no job.log: that node cannot see {folder.parent} "
+            where = f"{folder.parent}" if folder is not None else "the run folder"
+            return "failed", (f"the job went to node {node} and left no job.log: that node cannot see {where} "
                               f"(its filesystem is not shared with this one); keep jobs on this node with "
                               f"{rt.var('SLURM_NODE')}=local")
-    if not log.is_file():
-        return "failed", ("the job left the queue without a result and without job.log: cancelled before it ran, "
-                          "or SLURM could not start it" + (f" (SLURM: {acct})" if acct else ""))
+    if not has_log and not a:
+        return "cancelled", ("left the queue without starting (no job.log): cancelled while queued (scancel), or "
+                             "SLURM dropped it; submit it again if it was not cancelled on purpose")
+    if not has_log:
+        return "failed", f"the job left the queue without a result and without job.log (SLURM: {acct})"
     return "failed", "the job ended without a result" + (f" (SLURM: {acct})" if acct else "") + f"; job.log:\n{t}"
 
 

@@ -242,7 +242,20 @@ def test_job_gone_to_another_node(rt, slurm, tmp_path, monkeypatch):
     st, why = J.ended_state(rt, None, req / "a" / "job.log", job={}, node="spark-0808")
     assert st == "failed" and "went to node spark-0808" in why and "TT_SLURM_NODE=local" in why
     st, why = J.ended_state(rt, None, req / "a" / "job.log", job={})
-    assert st == "failed" and "without job.log" in why
+    assert st == "cancelled" and "without starting" in why          # no accounting, no job.log: it never started
+    st, why = J.ended_state(rt, "NODE_FAIL", req / "a" / "job.log", job={})
+    assert st == "failed" and "without job.log (SLURM: NODE_FAIL)" in why
+
+
+def test_classify_end_on_text(rt):
+    """cfd-translator's final_state(acct, log text): the same rules on the text of job.log's end."""
+    assert J.classify_end(rt, None, "", has_log=False)[0] == "cancelled"
+    assert J.classify_end(rt, None, "Traceback ...\nValueError: boom")[0] == "failed"
+    assert J.classify_end(rt, None, "error: Detected 1 oom_kill event in StepId=3.batch")[0] == "out_of_memory"
+    st, why = J.classify_end(rt, "OUT_OF_MEMORY", "")                  # no folder: the generic advice
+    assert st == "out_of_memory" and "run.mem" in why
+    assert J.classify_end(rt, None, "*** JOB 1 ON n CANCELLED AT 2026 DUE TO TIME LIMIT ***")[0] == "timed_out"
+    assert J.classify_end(rt, "CANCELLED by 1000", "") == ("cancelled", "cancelled by 1000 (scancel or cancel())")
 
 
 def test_cancel_request(rt, slurm, monkeypatch):
@@ -407,7 +420,7 @@ def test_short_cpus_per_task_option_respected(tmp_path, slurm, monkeypatch):
 def test_lost_node_only_on_a_cluster(rt, slurm):
     req = request(rt)
     st, why = J.ended_state(rt, None, req / "a" / "job.log", job={}, node="localhost")   # one node: not 'lost'
-    assert "went to node" not in why
+    assert "went to node" not in why and st == "cancelled"
 
 
 def test_job_timeout_s(rt, slurm, tmp_path):
