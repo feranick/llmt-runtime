@@ -1,5 +1,5 @@
 """server.py — what every translator's MCP server shares: stale installs, the tool wrapper, the server's log.
-Version: 2026.11.09.1
+Version: 2026.11.09.6
 
     guard = Server(RT, api.__file__, busy=api.pool_busy, shutdown=api.shutdown_workers)
     @server.tool()
@@ -27,6 +27,7 @@ from __future__ import annotations
 import atexit
 import faulthandler
 import functools
+import inspect
 import os
 import re
 import signal
@@ -92,10 +93,9 @@ class Server:
         self.pkg_dir = Path(package_file).resolve().parent
         self.busy = busy or (lambda: False)
         self.shutdown = shutdown or (lambda: None)
-        try:
-            self.period = float(rt.env("STALE_CHECK_S", "") or (period if period is not None else rt.stale_period))
-        except ValueError:
-            self.period = float(rt.stale_period)
+        self._period_arg = period
+        self.period = self.read_period()
+        self.budget_s = BUDGET_S          # a call's deadline, read at each call (a test or translator may lower it)
         self.state = {"inflight": 0, "background": 0, "exiting": False, "checked": 0.0, "why": None,
                       "shared": False, "serving": False}
         self.lock = threading.Lock()
@@ -196,8 +196,19 @@ class Server:
         t.start()
         return t
 
-    def watch(self) -> None:
-        """Exits this server when it is stale, may exit and is idle."""
+    def read_period(self) -> float:
+        """P_STALE_CHECK_S, else the period given to Server, else rt.stale_period (10 s)."""
+        try:
+            return float(self.rt.env("STALE_CHECK_S", "") or (self._period_arg if self._period_arg is not None
+                                                                else self.rt.stale_period))
+        except ValueError:
+            return float(self.rt.stale_period)
+
+    def watch(self, period: float | None = None) -> None:
+        """Exits this server when it is stale, may exit and is idle; checks every `period` s (default self.period)."""
+        if period is not None:
+            self.period = float(period)
+
         def loop():
             while True:
                 time.sleep(self.period)
@@ -211,6 +222,7 @@ class Server:
         watch starts; with log, the server's log (start_log); with signals, SIGTERM/SIGHUP/SIGINT stop the workers
         first (llmt servers --stop: re-raising skips atexit)."""
         self.state["serving"] = True
+        self.period = self.read_period()      # P_STALE_CHECK_S as it is when the server starts, not at import
         if log:
             self.start_log()
         if signals:
@@ -271,13 +283,16 @@ class Server:
                 return
 
     # ---- the tool wrapper
-    def tool(self, tool_error: type, budget_s: float = BUDGET_S):
+    def tool(self, tool_error: type, budget_s: float | None = None):
         """Decorator for every tool: refused with STALE_SERVER when stale and idle; otherwise run in a worker thread
-        under a deadline of budget_s; errors come back as tool_error with their text (SDK 2.x hides the text of other
-        exceptions; with the log, where the traceback is); calls logged; a stale server's answers carry server_stale."""
+        under a deadline of budget_s (default self.budget_s, read at each call); errors come back as tool_error with
+        their text (SDK 2.x hides the text of other exceptions; with the log, where the traceback is); calls logged; a
+        stale server's answers carry server_stale. The wrapper carries the tool's signature and type hints evaluated in
+        the tool's own module, so the MCP SDK reads them even under `from __future__ import annotations` (it would look
+        the names up in this module)."""
         def deco(fn):
             def bounded(*args, **kwargs):
-                with deadline(budget_s):
+                with deadline(self.budget_s if budget_s is None else budget_s):
                     return fn(*args, **kwargs)
 
             @functools.wraps(fn)
@@ -308,8 +323,22 @@ class Server:
                 if n and isinstance(r, dict):
                     r = {**r, "server_stale": n}
                 return r
+            _evaluated_hints(wrap, fn)
             return wrap
         return deco
+
+
+def _evaluated_hints(wrap, fn) -> None:
+    """Gives `wrap` the signature and annotations of `fn` with string annotations evaluated in fn's module."""
+    try:
+        sig = inspect.signature(fn, eval_str=True)
+    except Exception:  # noqa: BLE001 (a name that cannot be resolved: leave what functools.wraps copied)
+        return
+    wrap.__signature__ = sig
+    ann = {n: p.annotation for n, p in sig.parameters.items() if p.annotation is not inspect.Parameter.empty}
+    if sig.return_annotation is not inspect.Signature.empty:
+        ann["return"] = sig.return_annotation
+    wrap.__annotations__ = ann
 
 
 def _summary(kwargs: dict, limit: int = 300) -> str:

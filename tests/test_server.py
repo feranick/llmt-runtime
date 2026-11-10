@@ -137,6 +137,49 @@ def test_tool_wrapper(stale_server, rt, tmp_path):
     assert Path(s.log_path).parent == rt.out_root() / ".server"
 
 
+def test_tool_hints_from_the_tools_own_module(stale_server, tmp_path, monkeypatch):
+    """A translator module with `from __future__ import annotations` (string annotations): the wrapper carries them
+    evaluated in that module, so the MCP SDK can read `-> Image` (2026.11.09.6; it looked them up in this module)."""
+    import importlib.util
+    import inspect
+    import typing
+    s, *_ = stale_server
+    src = tmp_path / "toolmod.py"
+    src.write_text("from __future__ import annotations\n"
+                   "class Image:\n    pass\n"
+                   "def get_image(path: str, n: int = 1) -> Image:\n    return Image()\n")
+    spec = importlib.util.spec_from_file_location("toolmod", src)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    w = s.tool(ToolError)(mod.get_image)
+    sig = inspect.signature(w)
+    assert sig.return_annotation is mod.Image and sig.parameters["n"].annotation is int
+    assert typing.get_type_hints(w) == {"path": str, "n": int, "return": mod.Image}
+    assert w.__name__ == "get_image"
+
+
+def test_budget_read_at_each_call(stale_server):
+    pytest.importorskip("anyio")
+    s, *_ = stale_server
+    from llmt_runtime.slurm import remaining
+
+    @s.tool(ToolError)
+    def left():
+        return {"left": remaining()}
+    s.budget_s = 3.0                                              # lowered after decoration: still applies
+    assert 0 < asyncio.run(left())["left"] <= 3.0
+
+
+def test_stale_check_period_read_when_serving(stale_server, monkeypatch):
+    s, *_ = stale_server
+    monkeypatch.setattr(s, "start_log", lambda: None)
+    monkeypatch.setattr(s, "install_signal_handlers", lambda: None)
+    monkeypatch.setattr(s, "watch", lambda period=None: None)
+    monkeypatch.setenv("TT_STALE_CHECK_S", "3")                   # set after the Server was made
+    s.serve()
+    assert s.period == 3.0
+
+
 def test_log_keeps_the_newest(rt):
     d = rt.out_root() / ".server"
     d.mkdir(parents=True)

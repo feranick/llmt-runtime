@@ -1,6 +1,6 @@
 """llmt_runtime — the code the llm-translators share: worker processes, memory and out of memory, the SLURM executor,
 request folders and the MCP server's stale-install handling (llm-translators docs/EXECUTION.md made code).
-Version: 2026.11.09.5
+Version: 2026.11.09.6
 
     from llmt_runtime import Runtime, Hooks
     RT = Runtime(prefix="FEAT", cli="feat", package="fea_translator", version=__version__, kind="threads",
@@ -12,7 +12,7 @@ binds it); the rest (workers, memory, the call deadline) are plain functions.
 """
 from __future__ import annotations
 
-__version__ = "2026.11.09.5"
+__version__ = "2026.11.09.6"
 
 from .config import Hooks, Runtime  # noqa: E402
 
