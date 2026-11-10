@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.09.3
+Version: 2026.11.09.4
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -40,6 +40,7 @@ OOM_RE = re.compile(r"oom[-_ ]kill|out of memory", re.I)
 EXTEND_FILE = "extend"
 SUBMITTING_S = 600.0      # a study with no job.json yet is 'submitting' this long after its request was written
 SBATCH_TIMEOUT = 60.0
+FIND_JOB_S = 5.0          # kept for finding a job by name after sbatch timed out
 _SBATCH_DOWN: dict = {"until": 0.0, "why": ""}
 _PENDING: dict = {"t": 0.0, "v": None}
 
@@ -150,7 +151,10 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
     if left is not None and left < 2:
         return {"ok": False, "why": "could not submit: SLURM was too slow to answer within this call; run the study "
                                     "again"}
-    limit = SBATCH_TIMEOUT if left is None else min(SBATCH_TIMEOUT, left - 1)
+    # within a call, keep a few seconds for the look-up of a job a slow controller took after sbatch gave up (before
+    # 2026.11.09.4 sbatch had all the time left, so the look-up never ran inside an MCP call)
+    limit = SBATCH_TIMEOUT if left is None else min(SBATCH_TIMEOUT, left - FIND_JOB_S - 1 if left > FIND_JOB_S + 3
+                                                    else left - 1)
     adopted = None
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
@@ -196,7 +200,7 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
 
 def find_job(name: str) -> str | None:
     """The id of the one job in the queue with this name (squeue --name), else None."""
-    p = S.run(["squeue", "-h", f"--name={name}", "-o", "%i"], timeout=10)
+    p = S.run(["squeue", "-h", f"--name={name}", "-o", "%i"], timeout=FIND_JOB_S)
     if p is None or p.returncode != 0:
         return None
     ids = p.stdout.split()
@@ -377,7 +381,8 @@ def classify_end(rt, acct: str | None, log_tail: str, has_log: bool = True, fold
                              "SLURM dropped it; submit it again if it was not cancelled on purpose")
     if not has_log:
         return "failed", f"the job left the queue without a result and without job.log (SLURM: {acct})"
-    return "failed", "the job ended without a result" + (f" (SLURM: {acct})" if acct else "") + f"; job.log:\n{t}"
+    end = f"; job.log:\n{t}" if t.strip() else "; job.log is empty"
+    return "failed", "the job ended without a result" + (f" (SLURM: {acct})" if acct else "") + end
 
 
 def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMITTING_S) -> dict:

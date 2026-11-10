@@ -406,6 +406,27 @@ def test_slow_sbatch_job_adopted(rt, slurm, monkeypatch):
     assert J.read_job(req / "a")["job_id"] == "1001"
 
 
+def test_slow_sbatch_adopted_within_a_call(rt, slurm, monkeypatch):
+    """Inside an MCP call (a deadline) sbatch leaves time to find the job it may have submitted (2026.11.09.4: it had
+    all the time left, and the look-up never ran)."""
+    monkeypatch.setenv("FAKE_SBATCH_SLOW_AFTER", "30")
+    monkeypatch.setenv("TT_MODE", "sleep:30")
+    req = request(rt)
+    t0 = time.time()
+    with S.deadline(12):
+        info = J.submit(rt, req, "a", {})
+    assert info.get("job_id") == "1001" and "adopted" in info, info
+    assert time.time() - t0 < 12
+
+
+def test_failed_with_an_empty_log(rt, tmp_path):
+    log = tmp_path / "s" / "job.log"
+    log.parent.mkdir()
+    log.write_text("\n")
+    st, why = J.ended_state(rt, "NODE_FAIL", log, job={})
+    assert st == "failed" and why.endswith("(SLURM: NODE_FAIL); job.log is empty")
+
+
 def test_queue_summary_counts_each_node_once(rt, slurm, monkeypatch):
     monkeypatch.setenv("FAKE_SINFO_PARTITIONS", "debug*|1:00:00;long|infinite")   # the node in two partitions
     assert J.queue_summary(rt)["machine"] == {"cpus": 8, "cpus_allocated": 2, "cpus_idle": 6}

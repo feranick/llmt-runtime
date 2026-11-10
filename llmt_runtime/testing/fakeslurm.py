@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fakeslurm.py — fake SLURM commands for tests: sbatch, squeue, scancel, sacct, sinfo, scontrol in one script, called
 by the name it is invoked as (or the name as its first argument). State lives in $FAKE_SLURM_DIR (jobs/<id>.json).
-Version: 2026.11.09.1
+Version: 2026.11.09.4
 
 Merged from fea-translator (tests/fake_slurm), cfd-translator, lammps-translator and openmodelica-translator.
 
@@ -204,11 +204,13 @@ def sbatch(args):
 
 
 def _fmt(fmt: str, jid: str, rec: dict, state: str) -> str:
-    el = int(time.time() - rec["t0"])
+    t0 = rec.get("t0", time.time())
+    el = int(time.time() - t0)
     vals = {"i": jid, "T": state, "r": "Priority" if state == "PENDING" else "None",
             "S": os.environ.get("FAKE_START", "N/A") if state == "PENDING" else time.strftime(
-                "%Y-%m-%dT%H:%M:%S", time.localtime(rec["t0"])),
-            "M": f"{el // 60}:{el % 60:02d}", "j": rec["name"], "C": str(rec["cpus"]), "Q": str(rec.get("prio", 1000)),
+                "%Y-%m-%dT%H:%M:%S", time.localtime(t0)),
+            "M": f"{el // 60}:{el % 60:02d}", "j": rec.get("name", ""), "C": str(rec.get("cpus", 1)),
+            "Q": str(rec.get("prio", 1000)),
             "L": os.environ.get("FAKE_TIME_LEFT", "1:00:00"), "N": "" if state == "PENDING" else rec.get("node", ""),
             "n": "", "u": rec.get("user", ""), "m": rec.get("mem") or "0"}
     return re.sub(r"%(\w)", lambda m: vals.get(m.group(1), ""), fmt)
@@ -267,7 +269,7 @@ def scancel(args):
         rec["ended"] = time.time()
         rec.setdefault("sacct", f"CANCELLED by {os.getuid()}")
         _save(jid, rec)
-        if rec.get("pid"):
+        if rec.get("pid") and rec.get("log"):
             with open(rec["log"], "a") as fh:
                 fh.write(f"slurmstepd: error: *** JOB {jid} ON {rec.get('node')} CANCELLED AT "
                          f"{time.strftime('%Y-%m-%dT%H:%M:%S')} ***\n")
@@ -290,8 +292,8 @@ def sacct(args):
         else:
             st = "RUNNING" if _alive(rec.get("pid", 0)) else _final(jid, rec)
         ran = bool(rec.get("pid"))
-        vals = {"JobID": jid, "State": st, "NodeList": rec.get("node") if ran else "None assigned",
-                "JobName": rec["name"]}
+        vals = {"JobID": jid, "State": st, "NodeList": (rec.get("node") or "None assigned") if ran else "None assigned",
+                "JobName": rec.get("name", "")}
         print("|".join(vals.get(f, "") for f in fields))
     return 0
 
