@@ -419,6 +419,29 @@ def test_slow_sbatch_adopted_within_a_call(rt, slurm, monkeypatch):
     assert time.time() - t0 < 12
 
 
+def test_queue_summary_leaves_out_ended_jobs(rt, slurm, monkeypatch):
+    """squeue lists an ended job for MinJobAge in its final state: neither running nor queued (2026.11.09.5: it was
+    counted as queued)."""
+    monkeypatch.setenv("FAKE_MIN_JOB_AGE", "300")
+    monkeypatch.setenv("TT_MODE", "crash")
+    req = request(rt)
+    jid = J.submit(rt, req, "a", {})["job_id"]
+    assert wait_for(lambda: (slurm / "jobs" / f"{jid}.rc").is_file())
+    assert J.squeue([jid])[jid]["state"] == "FAILED"
+    assert J.queue_summary(rt)["queue"] == {"running": 0, "queued": 0, "cpus_in_use": 0}
+
+
+def test_slurm_commands_do_not_read_the_servers_stdin(tmp_path, monkeypatch):
+    """An MCP server speaks on its stdio: a command it runs gets /dev/null as stdin (2026.11.09.5)."""
+    b = tmp_path / "bin"
+    b.mkdir()
+    (b / "readstdin").write_text("#!/bin/sh\nread x && echo \"got:$x\" || echo eof\n")
+    (b / "readstdin").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{b}:/usr/bin:/bin")
+    p = S.run(["readstdin"], timeout=5)
+    assert p is not None and p.stdout.strip() == "eof"
+
+
 def test_failed_with_an_empty_log(rt, tmp_path):
     log = tmp_path / "s" / "job.log"
     log.parent.mkdir()

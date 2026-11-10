@@ -1,5 +1,5 @@
 """memory.py — the memory a run may use, and whose memory ran out when a solver was killed.
-Version: 2026.11.09.2
+Version: 2026.11.09.5
 
     memory_limit_mb()          SLURM_MEM_PER_NODE, else the cgroup's memory.max (v2) / memory.limit_in_bytes (v1)
     oom_kills(), oom_limit_hits()  cgroup counters: kills by the OOM killer; times the cgroup reached its limit
@@ -171,7 +171,7 @@ def kernel_oom_constraint(pid: int, since: float) -> str | None:
         return None
     try:
         r = subprocess.run(["journalctl", "-k", "-q", "-o", "cat", "--no-pager", "--since", f"@{int(since) - 5}"],
-                           capture_output=True, text=True, timeout=8)
+                           capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
     for ln in r.stdout.splitlines():
@@ -226,7 +226,7 @@ def node_jobs_text(total_mb: float | None = None) -> str:
         return ""
     try:
         r = subprocess.run(["squeue", "-h", "-w", node, "-t", "R", "-o", "%i|%m|%j"], capture_output=True, text=True,
-                           timeout=8)
+                           timeout=8, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return ""
     from .slurm import mem_mb

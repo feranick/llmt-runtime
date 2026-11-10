@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.09.4
+Version: 2026.11.09.5
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -157,7 +157,7 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
                                                     else left - 1)
     adopted = None
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=limit, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         why = f"sbatch did not answer within {limit:g} s (is slurmctld running?)"
         _SBATCH_DOWN.update(until=time.time() + 30, why=why)
@@ -457,11 +457,12 @@ def queue_summary(rt) -> dict:
         for line in p.stdout.splitlines():
             f = line.strip().split("|")
             if len(f) >= 4 and f[1].startswith(f"{rt.cli}:"):
-                if f[2] in ("RUNNING", "COMPLETING"):
+                if f[2] in ACTIVE:
                     out["queue"]["running"] += 1
                     out["queue"]["cpus_in_use"] += int(f[3]) if f[3].isdigit() else 0
-                else:
+                elif f[2] in QUEUED:
                     out["queue"]["queued"] += 1
+                # (any other state: an ended job squeue still lists for MinJobAge; neither running nor queued)
     nl = S.node_pin(rt)[1]
     # one row per node and partition: counted once per node (summing sinfo %C rows counted shared nodes per partition)
     p = S.run(["sinfo", "-h", "-N", "-o", "%N|%C", *(["-n", nl] if nl else [])])

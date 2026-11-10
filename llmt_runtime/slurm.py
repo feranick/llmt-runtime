@@ -1,5 +1,5 @@
 """slurm.py — the SLURM settings, the machine, caps, time limits and a call's time budget.
-Version: 2026.11.09.1
+Version: 2026.11.09.5
 
 Settings (P = the translator's prefix; llm-translators docs/EXECUTION.md):
     P_EXECUTOR local | slurm (local)        P_SLURM_MIN_MINUTES (rt.min_minutes): shorter studies run locally
@@ -76,7 +76,8 @@ def run(cmd: list[str], timeout: float = 15) -> subprocess.CompletedProcess | No
             return None
         timeout = min(timeout, left - 0.5)
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        # stdin from /dev/null: an MCP server speaks on its own stdio, which no command it runs may read
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired):
         return None
 
