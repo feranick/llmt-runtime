@@ -4,12 +4,12 @@ Status on 2026-11-09. All three phases are done for the four translators:
 
 | translator | version | what runs from llmt-runtime |
 |---|---|---|
-| fea-translator (feat) | 2026.11.09.10 | phases 1–3 |
+| fea-translator (feat) | 2026.11.10.1 | phases 1–3 |
 | cfd-translator (cfdt) | 2026.11.09.6 | phases 1–3 |
 | lammps-translator (lmpt) | 2026.11.09.6 | phases 1–3 |
 | openmodelica-translator (omct) | 2026.11.09.3 | phases 1–3 |
 
-The runtime is at 2026.11.09.7 (per-node `ahead_of`); llm-translators pinned 2026.11.09.6 until it is pinned again. Phase 1 covered workers, out of memory, how a job ended, version recording and request names. Phase 2 covered the SLURM layer. Phase 3 covered the MCP server's stale handling, tool wrapper, log and signals.
+The runtime is at 2026.11.10.1 (2026.11.09.7: per-node `ahead_of`; 2026.11.10.1: SLURM's one-year placeholder start is no estimate); llm-translators pinned 2026.11.09.6 until it is pinned again. Phase 1 covered workers, out of memory, how a job ended, version recording and request names. Phase 2 covered the SLURM layer. Phase 3 covered the MCP server's stale handling, tool wrapper, log and signals.
 
 On carbonio (release 2026.11.09.27):
 
@@ -21,7 +21,7 @@ Below is what is left. The items are grouped by repo, and each says where it cam
 
 ## 1. Before calling the migration finished
 
-- [ ] **Deploy to the other servers** (mochi, spark1, spark2) with `sudo ./llmt deploy --test`. Then check `machines()` from the Mac: every machine should report `runtime: 2026.11.09.7` and its `runtime_commit`.
+- [ ] **Deploy to the other servers** (mochi, spark1, spark2) with `sudo ./llmt deploy --test`. Then check `machines()` from the Mac: every machine should report `runtime: 2026.11.10.1` and its `runtime_commit`.
 - [ ] **lmpt through a real SLURM queue.** The phase-2 code has not yet submitted, run and collected a real lmpt job: on carbonio the node was busy and the bench was interrupted. When a server is idle, on the current release, in tmux (`--queue` sends every case to SLURM, whatever `LMPT_SLURM_MIN_MINUTES` says):
 
   ```
@@ -37,13 +37,13 @@ Below is what is left. The items are grouped by repo, and each says where it cam
   - On each machine with `P_EXECUTOR=slurm`, one fast benchmark per translator (feat `axial_bar`, cfdt `couette_2d`, lmpt `madelung_nacl`, omct `rc_step`).
   - Two benchmarks at once from two server processes. They should queue, not oversubscribe.
   - A result collected after the MCP connection was closed and reopened.
-- [ ] **Drop feat's `FEAT_SLURM_TIME` alias.** `RT.time_aliases={"estimate": "timeout"}` keeps old `config/env` files meaning what they meant. Once no machine sets `FEAT_SLURM_TIME=estimate`, remove the alias: then `estimate` means the runtime's estimate-based limit in feat too. On each machine (carbonio, mochi, spark1, spark2):
+- [x] **Drop feat's `FEAT_SLURM_TIME` alias** (feat 2026.11.10.1: also passes the study's estimate to `submit` and adds `timeout_for_limit`). `RT.time_aliases={"estimate": "timeout"}` keeps old `config/env` files meaning what they meant. Once no machine sets `FEAT_SLURM_TIME=estimate`, remove the alias: then `estimate` means the runtime's estimate-based limit in feat too. On each machine (carbonio, mochi, spark1, spark2):
 
   ```
   grep -H FEAT_SLURM_TIME /etc/llm-translators/env ~/.config/llm-translators/env 2>/dev/null
   ```
 
-  If none sets it, the feat chat drops the alias in feat's next version.
+  If none sets it, the feat chat drops the alias in feat's next version. Checked 2026-11-10: none of carbonio, mochi, spark1 and spark2 sets it; handed to the feat chat.
 - [ ] **Decide `CFDT_SLURM_MEM` against `CFDT_MAX_MEM`.** Since cfdt 2026.11.09.4, an explicit size in `CFDT_SLURM_MEM` is used as given. Before, it was cut down to `CFDT_MAX_MEM`. `auto` is still capped at the node's memory. Keep this (the runtime's rule for all four), or restore the cut for every translator through a runtime option.
 
 ## 2. llmt-runtime
@@ -100,6 +100,7 @@ Shared code that translators still copy, or work around:
 - [ ] **Tests on macOS** (`tests/test_llmt.py`), failing before this work:
   - The four Staging tests: macOS temporary paths `/var/…` resolve to `/private/var/…`, so the expected keys differ.
   - `test_starts_now`: the start time comes back None, probably because the fake `sbatch --test-only` relies on Linux-only behaviour.
+- [ ] **Router: SLURM's one-year placeholder start.** `expected_start()` in `llmt_router.py` turns `sbatch --test-only`'s start into minutes; a start 300 days or more ahead is the same placeholder as in squeue (runtime 2026.11.10.1). Treat it as no start time, with the runtime's note as `why`, so `typical_job_start_min` is None and placement treats the machine as SLURM giving no start time.
 - [ ] **`translators.json`: feat's `min_minutes` is 5, but feat's default is 1** (`FEAT_SLURM_MIN_MINUTES`, `RT.min_minutes`). `llmt tune` and the router read the JSON. Make them agree.
 - [ ] **`llmt gc`:** each server has several unused releases from the test builds (`--no-switch` builds never switched to). Run `sudo ./llmt gc` once everything is deployed.
 - [ ] **Docs:**

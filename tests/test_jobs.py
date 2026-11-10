@@ -163,6 +163,30 @@ def test_queued_with_reason_start_and_ahead(rt, slurm, monkeypatch):
     assert (st["b"]["ahead"], st["a"]["ahead"], st["c"]["ahead"]) == (0, 1, 2)
 
 
+def test_one_year_start_is_no_estimate(rt, slurm, monkeypatch):
+    """SLURM's placeholder start one year ahead (behind a job with no time limit: carbonio 2026-11-10, cfdt jobs
+    behind an UNLIMITED feat job showed 2027-11-09) is no estimate: expected_start_note, no expected_start."""
+    from llmt_runtime import requests as R
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    year = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 365 * 86400))
+    soon = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + 299 * 86400))
+    req = request(rt, ("a", "b"))
+    J.submit(rt, req, "a", {})
+    J.submit(rt, req, "b", {})
+    monkeypatch.setenv("FAKE_START", year)
+    st = J.job_states(rt, req, ["a", "b"])["a"]
+    assert st["state"] == "queued" and "expected_start" not in st and st["ahead"] == 0
+    assert st["expected_start_note"] == S.NO_START_NOTE and "no time limit" in st["expected_start_note"]
+    q = J.squeue([st["job_id"]])[st["job_id"]]
+    assert q["start"] == "N/A" and q["start_note"] == S.NO_START_NOTE
+    assert R.slurm_start(year) is None and S.start_epoch(year) is not None
+    _, nxt = R.timing_slurm(req, {"a": {"state": "queued", "eta_min": 5, "eta_min_max": 8, **st}}, {"a": st["job_id"]})
+    assert "no time limit ends" in nxt
+    monkeypatch.setenv("FAKE_START", soon)                            # 299 days: still SLURM's own estimate
+    st = J.job_states(rt, req, ["a"])["a"]
+    assert st["expected_start"] == soon and "expected_start_note" not in st and R.slurm_start(soon) is not None
+
+
 def test_ahead_counts_per_node(rt, slurm, monkeypatch):
     """Pinned jobs count only the jobs that can run on their node (spark1's job 506 counted spark2's 469-471)."""
     monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")

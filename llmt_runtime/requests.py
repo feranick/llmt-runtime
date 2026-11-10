@@ -1,6 +1,6 @@
 """requests.py — request folders, request names chosen by the caller, the version a request ran with, files under the
 output root, and the time left as clock times.
-Version: 2026.11.09.1
+Version: 2026.11.10.1
 
     new_request(prefix, request_name)  <out>/<prefix>_<YYYYmmdd_HHMMSS>_<hex6>, or <out>/<request_name>
     check_request_name(name)    ('new' | 'repeat' | 'error', detail): a repeated name returns that request's status,
@@ -20,6 +20,8 @@ import re
 import time
 import uuid
 from pathlib import Path
+
+from . import slurm as S
 
 REQUEST_NAME = re.compile(r"^run_[A-Za-z0-9_.-]{1,80}$")
 POLL_LIMIT_MIN = 5.0         # longer than this: tell the user when to come back instead of polling
@@ -128,13 +130,9 @@ def clock(t: float, now: float | None = None) -> str:
 
 
 def slurm_start(s: str | None) -> float | None:
-    """SLURM's expected start (local ISO time, e.g. 2026-10-18T22:22:27) as epoch seconds; None for N/A, Unknown."""
-    if not s:
-        return None
-    try:
-        return time.mktime(time.strptime(s.strip(), "%Y-%m-%dT%H:%M:%S"))
-    except ValueError:
-        return None
+    """SLURM's expected start (local ISO time, e.g. 2026-10-18T22:22:27) as epoch seconds; None for N/A, Unknown and
+    SLURM's one-year placeholder (slurm.no_planned_start)."""
+    return None if S.no_planned_start(s) else S.start_epoch(s)
 
 
 def timing_slurm(folder: Path, progress: dict, ids: dict, tool: str = "study_status") -> tuple[dict, str]:
@@ -164,6 +162,9 @@ def timing_slurm(folder: Path, progress: dict, ids: dict, tool: str = "study_sta
         when = f"around {t['expected_finish']} (at the latest {t['latest_finish']})"
     elif t_max is not None:
         when = f"by {t['latest_finish']} at the latest (no estimate of the run time yet)"
+    elif any(p.get("expected_start_note") == S.NO_START_NOTE for p in progress.values()):
+        when = ("when the job ahead of them with no time limit ends (SLURM gives no start time: it cannot plan behind "
+                "a job without a time limit)")
     else:
         when = "when the jobs ahead of them in the queue are done (SLURM gives no start time yet)"
     arg = "bench" if tool == "bench_status" else "request"

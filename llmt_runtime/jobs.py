@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.09.7
+Version: 2026.11.10.1
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -229,8 +229,9 @@ def failed_submission(rt, request: Path, name: str, info: dict, **keys) -> dict:
 # ----------------------------------------------------------------------------- the queue
 
 def squeue(ids: list[str]) -> dict | None:
-    """{id: {state, reason, start, elapsed_min, node}} of the given jobs still in the queue (one call); None when
-    SLURM does not answer (then nothing can be said: the jobs are not 'gone')."""
+    """{id: {state, reason, start, elapsed_min, node, start_note?}} of the given jobs still in the queue (one call);
+    None when SLURM does not answer (then nothing can be said: the jobs are not 'gone'). SLURM's one-year placeholder
+    start (slurm.no_planned_start) reads 'N/A', with start_note saying why."""
     if not ids:
         return {}
     p = S.run(["squeue", "-h", f"--jobs={','.join(str(i) for i in ids)}", "-o", "%i|%T|%r|%S|%M|%N"])
@@ -246,6 +247,8 @@ def squeue(ids: list[str]) -> dict | None:
         if len(f) >= 5:
             out[f[0]] = {"state": f[1], "reason": f[2], "start": f[3], "elapsed_min": S.elapsed_minutes(f[4]),
                          "node": (f[5] if len(f) > 5 else "") or None}
+            if S.no_planned_start(f[3]):
+                out[f[0]].update(start="N/A", start_note=S.NO_START_NOTE)
     return out
 
 
@@ -409,7 +412,7 @@ def classify_end(rt, acct: str | None, log_tail: str, has_log: bool = True, fold
 
 def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMITTING_S) -> dict:
     """{name: {state, job_id, ...}} for the request's SLURM studies, from the files and the queue: done (a result),
-    queued (reason, expected_start, ahead), running (job_elapsed_min, node), unknown (SLURM did not answer), a final
+    queued (reason, expected_start or expected_start_note, ahead), running (job_elapsed_min, node), unknown (SLURM did not answer), a final
     state (FINAL, with why), or queued with reason 'submitting' while a submission may still be under way."""
     request = Path(request)
     jobs, out = {}, {}
@@ -448,6 +451,8 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
                 rec = {"state": "queued", "job_id": jid, "reason": st["reason"]}
                 if st["start"] and st["start"] not in ("N/A", "Unknown", "None"):
                     rec["expected_start"] = st["start"]
+                elif st.get("start_note"):
+                    rec["expected_start_note"] = st["start_note"]
                 rec["ahead"] = ahead_of(jid, pend) if pend is not None else None
             else:
                 rec = {"state": "running", "job_id": jid, "job_elapsed_min": st["elapsed_min"]}

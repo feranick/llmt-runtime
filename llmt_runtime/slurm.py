@@ -1,5 +1,5 @@
 """slurm.py — the SLURM settings, the machine, caps, time limits and a call's time budget.
-Version: 2026.11.09.5
+Version: 2026.11.10.1
 
 Settings (P = the translator's prefix; llm-translators docs/EXECUTION.md):
     P_EXECUTOR local | slurm (local)        P_SLURM_MIN_MINUTES (rt.min_minutes): shorter studies run locally
@@ -25,6 +25,8 @@ Per study: "run": {"timeout_s", "mem", "procs", "queue"}.
 The machine: cluster_nodes() (scontrol -o show node: kept 60 s; a failure is asked again, but not within 5 s, so
 a dead controller costs one timeout per call), this_node(), node_pin() / node_status(), node_cores(), node_mem_mb()
 (RealMemory of the node jobs are pinned to, else the largest), caps() with it.
+
+SLURM's start times: start_epoch(s); no_planned_start(s) for its one-year placeholder (NO_START_DAYS, NO_START_NOTE).
 
 A call's time budget: deadline(seconds) bounds every SLURM command of the thread (run()) to what is left of the call,
 so each MCP tool answers within its wait_s; remaining() says how much.
@@ -266,6 +268,29 @@ def slurm_minutes(t: str | None) -> float | None:
         return days * 1440 + h * 60 + m + sec / 60
     except (ValueError, KeyError):
         return None
+
+
+NO_START_DAYS = 300
+NO_START_NOTE = ("SLURM gives no start time: a job ahead of it (or running on the node) has no time limit; it starts "
+                 "when that one ends")
+
+
+def start_epoch(s: str | None) -> float | None:
+    """SLURM's start time (local ISO time, e.g. 2026-10-18T22:22:27) as epoch seconds; None for N/A, Unknown, None."""
+    if not s:
+        return None
+    try:
+        return time.mktime(time.strptime(s.strip(), "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def no_planned_start(s: str | None, now: float | None = None) -> bool:
+    """A start NO_START_DAYS (300) days or more ahead: SLURM's placeholder when it cannot plan the job, typically
+    behind a job with no time limit (carbonio 2026-11-10: three cfdt jobs behind a feat job with --time UNLIMITED
+    showed 2027-11-09)."""
+    t = start_epoch(s)
+    return t is not None and t - (time.time() if now is None else now) >= NO_START_DAYS * 86400
 
 
 def elapsed_minutes(t: str | None) -> float | None:
