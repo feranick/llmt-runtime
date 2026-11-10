@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.09.5
+Version: 2026.11.09.7
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -249,11 +249,13 @@ def squeue(ids: list[str]) -> dict | None:
     return out
 
 
-def pending_jobs() -> list[tuple[float, int]] | None:
-    """(priority, id) of every pending job in the queue (one squeue call, kept 3 s); None when SLURM does not answer."""
+def pending_detail() -> list[tuple[float, int, frozenset]] | None:
+    """(priority, id, requested nodes) of every pending job in the queue (one squeue call, kept 3 s); the nodes are
+    the job's requested node list (squeue %n, expanded), empty when SLURM may choose; None when SLURM does not
+    answer."""
     if time.time() - _PENDING["t"] < 3 and _PENDING["v"] is not None:
         return _PENDING["v"]
-    p = S.run(["squeue", "-h", "-t", "PENDING", "-o", "%i|%Q"])
+    p = S.run(["squeue", "-h", "-t", "PENDING", "-o", "%i|%Q|%n"])
     if p is None or p.returncode != 0:
         return None
     out = []
@@ -266,26 +268,46 @@ def pending_jobs() -> list[tuple[float, int]] | None:
             prio = float(f[1]) if len(f) > 1 and f[1] else 0.0
         except ValueError:
             prio = 0.0
-        out.append((prio, int(jid)))
+        req = f[2].strip() if len(f) > 2 else ""
+        nodes = frozenset(S.expand_nodelist(req)) if req and req not in ("(null)", "N/A", "None") else frozenset()
+        out.append((prio, int(jid), nodes))
     _PENDING.update(t=time.time(), v=out)
     return out
 
 
-def ahead_of(job_id: str, pending: list[tuple[float, int]] | None = None) -> int | None:
-    """Pending jobs SLURM will consider before this one (higher priority, or equal and submitted earlier; all of the
-    queue's, not only the translators')."""
+def pending_jobs() -> list[tuple[float, int]] | None:
+    """(priority, id) of every pending job in the queue (pending_detail without the nodes); None when SLURM does not
+    answer."""
+    d = pending_detail()
+    return None if d is None else [(p, i) for p, i, _ in d]
+
+
+def share_node(a: frozenset, b: frozenset) -> bool:
+    """Two pending jobs can run on the same node: either may go anywhere (no node list), or their lists meet."""
+    return not a or not b or bool(set(a) & set(b))
+
+
+def ahead_of(job_id: str, pending: list | None = None, share=None) -> int | None:
+    """Pending jobs SLURM will consider before this one on the node(s) it can run on: higher priority, or equal and
+    submitted earlier, and able to share a node with it (share(nodes_a, nodes_b), default share_node). All of the
+    queue's jobs, not only the translators'. pending: pending_detail()'s rows (default), or pending_jobs()' (priority,
+    id) pairs, which count as able to go anywhere. Before 2026.11.09.7 jobs pinned to another node of a cluster counted
+    too (spark1's job 506 counted spark2's 469-471)."""
     if pending is None:
-        pending = pending_jobs()
+        pending = pending_detail()
     if pending is None:
         return None
     try:
         me = int(str(job_id).split("_")[0])
     except ValueError:
         return None
-    mine = next((p for p, i in pending if i == me), None)
+    share = share or share_node
+    rows = [r if len(r) >= 3 else (r[0], r[1], frozenset()) for r in pending]
+    mine = next((r for r in rows if r[1] == me), None)
     if mine is None:
-        return sum(1 for _, i in pending if i < me)
-    return sum(1 for p, i in pending if i != me and (p > mine or (p == mine and i < me)))
+        return sum(1 for _, i, _ in rows if i < me)
+    p0, _, n0 = mine
+    return sum(1 for p, i, n in rows if i != me and (p > p0 or (p == p0 and i < me)) and share(n0, n))
 
 
 def sacct_rows(ids: list[str]) -> dict:
@@ -415,7 +437,7 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
     q = {i: v for i, v in q.items() if i not in ended}      # ended jobs squeue still lists: gone
     gone = [j["job_id"] for n, j in jobs.items() if j["job_id"] not in q and not result_path(rt, request, n).is_file()]
     acct = sacct_rows(gone) if gone else {}
-    pend = pending_jobs() if any(v["state"] in QUEUED for v in q.values()) else []
+    pend = pending_detail() if any(v["state"] in QUEUED for v in q.values()) else []
     for n, j in jobs.items():
         jid = j["job_id"]
         if result_path(rt, request, n).is_file():

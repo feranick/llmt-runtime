@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fakeslurm.py — fake SLURM commands for tests: sbatch, squeue, scancel, sacct, sinfo, scontrol in one script, called
 by the name it is invoked as (or the name as its first argument). State lives in $FAKE_SLURM_DIR (jobs/<id>.json).
-Version: 2026.11.09.4
+Version: 2026.11.09.7
 
 Merged from fea-translator (tests/fake_slurm), cfd-translator, lammps-translator and openmodelica-translator.
 
@@ -178,7 +178,7 @@ def sbatch(args):
     rec = {"name": opt.get("job-name", script.name), "cpus": ntasks * cpus, "t0": time.time(),
            "log": opt.get("output", str(script.parent / f"slurm-{jid}.out")), "pid": 0, "args": args,
            "node": node, "prio": int(os.environ.get("FAKE_PRIORITY", "1000")), "mem": opt.get("mem"),
-           "user": os.environ.get("USER", "user"), "time": opt.get("time")}
+           "user": os.environ.get("USER", "user"), "time": opt.get("time"), "req": opt.get("nodelist") or ""}
     if os.environ.get("FAKE_SBATCH_PENDING") or os.environ.get("FAKE_PENDING"):
         rec["state"] = "PENDING"
     else:
@@ -212,7 +212,7 @@ def _fmt(fmt: str, jid: str, rec: dict, state: str) -> str:
             "M": f"{el // 60}:{el % 60:02d}", "j": rec.get("name", ""), "C": str(rec.get("cpus", 1)),
             "Q": str(rec.get("prio", 1000)),
             "L": os.environ.get("FAKE_TIME_LEFT", "1:00:00"), "N": "" if state == "PENDING" else rec.get("node", ""),
-            "n": "", "u": rec.get("user", ""), "m": rec.get("mem") or "0"}
+            "n": rec.get("req", ""), "u": rec.get("user", ""), "m": rec.get("mem") or "0"}
     return re.sub(r"%(\w)", lambda m: vals.get(m.group(1), ""), fmt)
 
 

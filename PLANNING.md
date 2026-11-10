@@ -6,10 +6,10 @@ Status on 2026-11-09. All three phases are done for the four translators:
 |---|---|---|
 | fea-translator (feat) | 2026.11.09.10 | phases 1–3 |
 | cfd-translator (cfdt) | 2026.11.09.6 | phases 1–3 |
-| lammps-translator (lmpt) | 2026.11.09.5 | phases 1–3 |
+| lammps-translator (lmpt) | 2026.11.09.6 | phases 1–3 |
 | openmodelica-translator (omct) | 2026.11.09.3 | phases 1–3 |
 
-The runtime is at 2026.11.09.6, pinned in llm-translators. Phase 1 covered workers, out of memory, how a job ended, version recording and request names. Phase 2 covered the SLURM layer. Phase 3 covered the MCP server's stale handling, tool wrapper, log and signals.
+The runtime is at 2026.11.09.7 (per-node `ahead_of`); llm-translators pinned 2026.11.09.6 until it is pinned again. Phase 1 covered workers, out of memory, how a job ended, version recording and request names. Phase 2 covered the SLURM layer. Phase 3 covered the MCP server's stale handling, tool wrapper, log and signals.
 
 On carbonio (release 2026.11.09.27):
 
@@ -21,7 +21,7 @@ Below is what is left. The items are grouped by repo, and each says where it cam
 
 ## 1. Before calling the migration finished
 
-- [ ] **Deploy to the other servers** (mochi, spark1, spark2) with `sudo ./llmt deploy --test`. Then check `machines()` from the Mac: every machine should report `runtime: 2026.11.09.6` and its `runtime_commit`.
+- [ ] **Deploy to the other servers** (mochi, spark1, spark2) with `sudo ./llmt deploy --test`. Then check `machines()` from the Mac: every machine should report `runtime: 2026.11.09.7` and its `runtime_commit`.
 - [ ] **lmpt through a real SLURM queue.** Run `LMPT_EXECUTOR=slurm LMPT_SLURM_MIN_MINUTES=0 llmt bench lmpt madelung_nacl` on a server whose queue is empty. The phase-2 code has not yet submitted, run and collected a real lmpt job: on carbonio the node was busy and the bench was interrupted.
 - [ ] **The machine tests the original plan asked for, not done yet:**
   - On each machine with `P_EXECUTOR=slurm`, one fast benchmark per translator (feat `axial_bar`, cfdt `couette_2d`, lmpt `madelung_nacl`, omct `rc_step`).
@@ -68,10 +68,9 @@ Shared code that translators still copy, or work around:
 - [ ] **cfdt:**
   - Two tests fail only on macOS, before and after the migration: `test_errors_reach_the_caller_as_tool_errors` (likely the MCP SDK version on the Mac) and `test_vehicle_aero_guide_and_ahmed_benchmarks` (snappy). Make them pass or skip where the dependency is missing.
   - The new bench test (`test_runtime.py`, the bench runs a case once) depends on timing: a 2 s sleep while the job is held. Watch it on loaded machines.
-  - The per-node queue position (`pending_ahead`) costs an extra `squeue` call per status. Fold it into the runtime's `ahead_of` as an option.
-- [ ] **lmpt:**
-  - `Exception ignored … Pool.__del__ … 'NoneType' object has no attribute 'dumps'` at the end of the suite: a test leaves a `multiprocessing.Pool` to be collected at exit. Find it and `terminate()` it in the test.
-  - The tests assume `$USER` is set, because `queue()` filters squeue by it. Set a default in `conftest.py`.
+  - Drop `pending_ahead` (its extra `squeue` call per status): the runtime's `ahead_of` counts per node since 2026.11.09.7. Raise cfdt's floor to `>=2026.11.09.7`.
+- [x] **lmpt (2026.11.09.6):** the `Pool.__del__` noise at the end of the suite (a session fixture stops `api._POOL`), `$USER` defaulted in `conftest.py`, and the subprocess tests keep `PYTHONPATH`.
+- [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.
 - [ ] **omct:** nothing open beyond the shared items: the log summary hook and `list_jobs`.
 - [ ] **build123d-translator (b3dt):** optional. It has no executor, but its MCP server could use `llmt_runtime.server.Server` for the same stale handling, tool wrapper and log.
 

@@ -163,6 +163,29 @@ def test_queued_with_reason_start_and_ahead(rt, slurm, monkeypatch):
     assert (st["b"]["ahead"], st["a"]["ahead"], st["c"]["ahead"]) == (0, 1, 2)
 
 
+def test_ahead_counts_per_node(rt, slurm, monkeypatch):
+    """Pinned jobs count only the jobs that can run on their node (spark1's job 506 counted spark2's 469-471)."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    req = request(rt, ("s2a", "s2b", "any", "s1", "both"))
+    monkeypatch.setenv("TT_SLURM_NODE", "spark2")
+    J.submit(rt, req, "s2a", {})
+    J.submit(rt, req, "s2b", {})
+    monkeypatch.delenv("TT_SLURM_NODE")
+    J.submit(rt, req, "any", {})                                     # may go anywhere: shares every node
+    monkeypatch.setenv("TT_SLURM_NODE", "spark1")
+    J.submit(rt, req, "s1", {})
+    monkeypatch.setenv("TT_SLURM_NODE", "spark[1-2]")
+    J.submit(rt, req, "both", {})
+    st = J.job_states(rt, req, ["s2a", "s2b", "any", "s1", "both"])
+    assert [st[n]["ahead"] for n in ("s2a", "s2b", "any", "s1", "both")] == [0, 1, 2, 1, 4]
+    ids = {n: int(st[n]["job_id"]) for n in st}
+    assert J.pending_jobs() == [(1000.0, ids[n]) for n in ("s2a", "s2b", "any", "s1", "both")]   # old shape
+    assert J.pending_detail()[3] == (1000.0, ids["s1"], frozenset({"spark1"}))
+    assert J.ahead_of(st["s1"]["job_id"], J.pending_jobs()) == 3        # 2-tuples: everything shares, as before
+    assert J.ahead_of(st["s1"]["job_id"], share=lambda a, b: True) == 3
+    assert J.ahead_of(st["both"]["job_id"], share=lambda a, b: bool(a & b)) == 3   # a stricter rule: "any" not counted
+
+
 def test_squeue_down_is_unknown_not_gone(rt, slurm, monkeypatch):
     monkeypatch.setenv("TT_MODE", "sleep:5")
     req = request(rt)
