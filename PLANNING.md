@@ -22,12 +22,28 @@ Below is what is left. The items are grouped by repo, and each says where it cam
 ## 1. Before calling the migration finished
 
 - [ ] **Deploy to the other servers** (mochi, spark1, spark2) with `sudo ./llmt deploy --test`. Then check `machines()` from the Mac: every machine should report `runtime: 2026.11.09.7` and its `runtime_commit`.
-- [ ] **lmpt through a real SLURM queue.** Run `LMPT_EXECUTOR=slurm LMPT_SLURM_MIN_MINUTES=0 llmt bench lmpt madelung_nacl` on a server whose queue is empty. The phase-2 code has not yet submitted, run and collected a real lmpt job: on carbonio the node was busy and the bench was interrupted.
+- [ ] **lmpt through a real SLURM queue.** The phase-2 code has not yet submitted, run and collected a real lmpt job: on carbonio the node was busy and the bench was interrupted. When a server is idle, on the current release, in tmux (`--queue` sends every case to SLURM, whatever `LMPT_SLURM_MIN_MINUTES` says):
+
+  ```
+  tmux new -s lmptbench
+  R=/opt/llm-translators/current
+  LMPT_EXECUTOR=slurm LMPT_SLURM_MIN_MINUTES=0 $R/bin/run lmpt bench --queue
+  LMPT_EXECUTOR=slurm LMPT_SLURM_MIN_MINUTES=0 $R/bin/run lmpt bench --queue spce_water
+  squeue -u $USER          # afterwards: nothing left
+  ```
+
+  Send the output to the lmpt chat: its README note goes into lmpt's next version.
 - [ ] **The machine tests the original plan asked for, not done yet:**
   - On each machine with `P_EXECUTOR=slurm`, one fast benchmark per translator (feat `axial_bar`, cfdt `couette_2d`, lmpt `madelung_nacl`, omct `rc_step`).
   - Two benchmarks at once from two server processes. They should queue, not oversubscribe.
   - A result collected after the MCP connection was closed and reopened.
-- [ ] **Drop feat's `FEAT_SLURM_TIME` alias.** `RT.time_aliases={"estimate": "timeout"}` keeps old `config/env` files meaning what they meant. Once no machine sets `FEAT_SLURM_TIME=estimate`, remove the alias: then `estimate` means the runtime's estimate-based limit in feat too. Check with `grep -r FEAT_SLURM_TIME /etc/llm-translators/env ~/.config/llm-translators/env`.
+- [ ] **Drop feat's `FEAT_SLURM_TIME` alias.** `RT.time_aliases={"estimate": "timeout"}` keeps old `config/env` files meaning what they meant. Once no machine sets `FEAT_SLURM_TIME=estimate`, remove the alias: then `estimate` means the runtime's estimate-based limit in feat too. On each machine (carbonio, mochi, spark1, spark2):
+
+  ```
+  grep -H FEAT_SLURM_TIME /etc/llm-translators/env ~/.config/llm-translators/env 2>/dev/null
+  ```
+
+  If none sets it, the feat chat drops the alias in feat's next version.
 - [ ] **Decide `CFDT_SLURM_MEM` against `CFDT_MAX_MEM`.** Since cfdt 2026.11.09.4, an explicit size in `CFDT_SLURM_MEM` is used as given. Before, it was cut down to `CFDT_MAX_MEM`. `auto` is still capped at the node's memory. Keep this (the runtime's rule for all four), or restore the cut for every translator through a runtime option.
 
 ## 2. llmt-runtime
@@ -64,12 +80,13 @@ Shared code that translators still copy, or work around:
 
 ## 3. The translators
 
-- [ ] **feat:** nothing open beyond the alias in section 1.
+- [ ] **feat:** nothing open beyond the alias in section 1. The feat chat sends shared problems here as ready-to-paste prompts (runtime first, then feat's floor only if needed, then the pin), and checks releases as in section 5: `llmt deploy --no-switch`, `llmt test runtime feat` and the tool listing in tmux, then `llmt rollback <release>`.
 - [ ] **cfdt:**
   - Two tests fail only on macOS, before and after the migration: `test_errors_reach_the_caller_as_tool_errors` (likely the MCP SDK version on the Mac) and `test_vehicle_aero_guide_and_ahmed_benchmarks` (snappy). Make them pass or skip where the dependency is missing.
   - The new bench test (`test_runtime.py`, the bench runs a case once) depends on timing: a 2 s sleep while the job is held. Watch it on loaded machines.
   - Drop `pending_ahead` (its extra `squeue` call per status): the runtime's `ahead_of` counts per node since 2026.11.09.7. Raise cfdt's floor to `>=2026.11.09.7`.
 - [x] **lmpt (2026.11.09.6):** the `Pool.__del__` noise at the end of the suite (a session fixture stops `api._POOL`), `$USER` defaulted in `conftest.py`, and the subprocess tests keep `PYTHONPATH`.
+- [ ] **lmpt, next version:** `extend`, as its own version, following the outline under "`extend` beyond feat" in section 2.
 - [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.
 - [ ] **omct:** nothing open beyond the shared items: the log summary hook and `list_jobs`.
 - [ ] **build123d-translator (b3dt):** optional. It has no executor, but its MCP server could use `llmt_runtime.server.Server` for the same stale handling, tool wrapper and log.
