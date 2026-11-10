@@ -100,7 +100,7 @@ Shared code that translators still copy, or work around:
 - [ ] **Tests on macOS** (`tests/test_llmt.py`), failing before this work:
   - The four Staging tests: macOS temporary paths `/var/…` resolve to `/private/var/…`, so the expected keys differ.
   - `test_starts_now`: the start time comes back None, probably because the fake `sbatch --test-only` relies on Linux-only behaviour.
-- [ ] **Router: SLURM's one-year placeholder start.** `expected_start()` in `llmt_router.py` turns `sbatch --test-only`'s start into minutes; a start 300 days or more ahead is the same placeholder as in squeue (runtime 2026.11.10.1). Treat it as no start time, with the runtime's note as `why`, so `typical_job_start_min` is None and placement treats the machine as SLURM giving no start time.
+- [x] **Router: SLURM's one-year placeholder start** (llmt_router 2026.11.10.1, test `test_one_year_start_is_no_start`). `expected_start()` in `llmt_router.py` turns `sbatch --test-only`'s start into minutes; a start 300 days or more ahead is the same placeholder as in squeue (runtime 2026.11.10.1). Treat it as no start time, with the runtime's note as `why`, so `typical_job_start_min` is None and placement treats the machine as SLURM giving no start time.
 - [ ] **`translators.json`: feat's `min_minutes` is 5, but feat's default is 1** (`FEAT_SLURM_MIN_MINUTES`, `RT.min_minutes`). `llmt tune` and the router read the JSON. Make them agree.
 - [ ] **`llmt gc`:** each server has several unused releases from the test builds (`--no-switch` builds never switched to). Run `sudo ./llmt gc` once everything is deployed.
 - [ ] **Docs:**
