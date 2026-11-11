@@ -85,7 +85,7 @@ Shared code that translators still copy, or work around:
   - Two tests fail only on macOS, before and after the migration: `test_errors_reach_the_caller_as_tool_errors` (likely the MCP SDK version on the Mac) and `test_vehicle_aero_guide_and_ahmed_benchmarks` (snappy). Make them pass or skip where the dependency is missing.
   - The new bench test (`test_runtime.py`, the bench runs a case once) depends on timing: a 2 s sleep while the job is held. Watch it on loaded machines.
   - Drop `pending_ahead` (its extra `squeue` call per status): the runtime's `ahead_of` counts per node since 2026.11.09.7. Raise cfdt's floor to `>=2026.11.09.7`.
-- [ ] **cfdt: multi-node jobs (runtime 2026.11.11.1), for Perlmutter (S50 sliding mesh at 512 ranks).**
+- [x] **cfdt: multi-node jobs (runtime 2026.11.11.1, `--nodes=1` for every one-node MPI job since 2026.11.11.2), for Perlmutter (S50 sliding mesh at 512 ranks).** Done by the cfdt chat: `one_node` dropped, ranks capped at `max_job_procs`, floor 2026.11.11.1, `other/supercomputers/clusters.md` updated. Still to verify on Perlmutter: a 256-rank, 2-node run, then 4 × 128.
   - Drop `one_node=True` from `runtime.py` (or keep it and set it from a setting): with it, jobs stay on one node whatever `CFDT_SLURM_NODES` says.
   - `procs_for_job` and cfdt's own `caps()`/`node_cores()` cap ranks at one node's cores: use `S.max_job_procs(RT)` and the runtime's `caps` (`procs`, `procs_from`, `nodes`, `mem_per`).
   - `mem_auto` stays the job's total: the runtime splits it over the nodes. Check the cell-based estimate scales with the ranks.

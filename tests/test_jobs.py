@@ -139,10 +139,14 @@ def test_one_node_and_default_stay_on_one_node(tmp_path, slurm, monkeypatch):
     J.submit(rt, req, "a", {})
     assert {"--ntasks=128", "--nodes=1"} <= set(sbatch_lines(req)) and "procs" not in S.caps(rt)
     assert S.max_nodes(rt) == 1 and S.status_key(rt)["max_nodes"] == 1
-    rt = multinode(tmp_path, monkeypatch, nodes=None)                 # P_SLURM_NODES unset: one node, lines as before
-    J.submit(rt, req, "a", {})
+    rt = multinode(tmp_path, monkeypatch, nodes=None)                 # P_SLURM_NODES unset: one node, --nodes=1
+    J.submit(rt, req, "a", {})                                        # (SLURM_NODE=any must not spread the ranks)
     ln = sbatch_lines(req)
-    assert "--ntasks=128" in ln and not any(x.startswith("--nodes") for x in ln) and "procs" not in S.caps(rt)
+    assert {"--ntasks=128", "--nodes=1"} <= set(ln) and "procs" not in S.caps(rt)
+    monkeypatch.setenv("TT_SLURM_ARGS", "-N 1 --exclusive")           # the user's own --nodes: not written twice
+    J.submit(rt, req, "a", {})
+    assert not any(x.startswith("--nodes") for x in sbatch_lines(req))
+    monkeypatch.delenv("TT_SLURM_ARGS")
     rt = multinode(tmp_path, monkeypatch, nodes="99")                 # at most the nodes there are
     assert S.max_nodes(rt) == 6 and S.max_job_procs(rt) == 768
     monkeypatch.setenv("TT_SLURM_NODE", "nid001")                     # pinned to one node: one node

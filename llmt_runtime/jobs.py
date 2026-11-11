@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.11.1
+Version: 2026.11.11.2
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -86,8 +86,10 @@ def job_name(rt, request: Path, name: str) -> str:
 def resource_lines(rt, study: dict, procs: int) -> list[str]:
     """The resource options (without '#SBATCH '): hooks.resource_lines, else by kind. threads: --ntasks=1
     --cpus-per-task=N. mpi: --ntasks=N and --ntasks-per-core=1 (OpenMPI 5 refuses more ranks than physical cores in
-    the job's CPU set; mochi, cfdt), unless P_SLURM_ARGS already says how to place them; --nodes=1 with rt.one_node,
-    or when P_SLURM_NODES allows several and the ranks fit on one node; ranks beyond a node's cores: --nodes=K and a
+    the job's CPU set; mochi, cfdt), unless P_SLURM_ARGS already says how to place them; --nodes=1 whenever the job
+    is on one node (max_nodes 1, or the ranks fit on one node's cores), unless P_SLURM_ARGS has its own --nodes/-N:
+    without it, SLURM may spread an MPI job's ranks over nodes (P_SLURM_NODE=any on a multi-node cluster; before
+    2026.11.11.2 only rt.one_node wrote it). Ranks beyond a node's cores, with P_SLURM_NODES above 1: --nodes=K and a
     balanced --ntasks-per-node (slurm.job_layout; 512 ranks on 128-core nodes: 4 x 128)."""
     if rt.hooks.resource_lines:
         return list(rt.hooks.resource_lines(study, procs))
@@ -97,7 +99,8 @@ def resource_lines(rt, study: dict, procs: int) -> list[str]:
     if nodes > 1:
         out = [f"--ntasks={procs}", f"--nodes={nodes}", f"--ntasks-per-node={per}"]
     else:
-        out = [f"--ntasks={procs}"] + (["--nodes=1"] if rt.one_node or S.max_nodes(rt) > 1 else [])
+        own = S.has_opt(S.slurm_args(rt), "--nodes", shorts=("-N",))
+        out = [f"--ntasks={procs}"] + ([] if own else ["--nodes=1"])
     if not S.has_opt(S.slurm_args(rt), "--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task",
                      shorts=("-c",)):
         out.append("--ntasks-per-core=1")
