@@ -73,6 +73,121 @@ def test_job_script_mpi(tmp_path, slurm, monkeypatch):
     assert "--ntasks-per-core" not in (req / "a" / "job.sh").read_text()
 
 
+PERLMUTTER = "\n".join(
+    f"NodeName=nid{i:03d} CoresPerSocket=64 CPUAlloc=0 CPUTot=256 NodeAddr=nid{i:03d} NodeHostName=nid{i:03d} "
+    f"RealMemory=512000 Sockets=2 State=IDLE ThreadsPerCore=2" for i in range(1, 7))
+
+
+def multinode(tmp_path, monkeypatch, nodes="4", **kw):
+    f = tmp_path / "nodes.txt"
+    f.write_text(PERLMUTTER)                                          # six 128-core nodes, 500 GB each
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    monkeypatch.setenv("TT_SLURM_NODE", "any")
+    if nodes:
+        monkeypatch.setenv("TT_SLURM_NODES", nodes)
+    else:
+        monkeypatch.delenv("TT_SLURM_NODES", raising=False)
+    S.forget()
+    return make_rt(tmp_path, kind="mpi", **kw)
+
+
+def sbatch_lines(req, name="a"):
+    return [ln[len("#SBATCH "):] for ln in (req / name / "job.sh").read_text().splitlines() if ln.startswith("#SBATCH")]
+
+
+def test_multinode_512_ranks_on_128_core_nodes(tmp_path, slurm, monkeypatch):
+    """cfdt on Perlmutter (S50 sliding mesh at 512 ranks): 4 nodes x 128, --mem per node, caps cores x nodes."""
+    rt = multinode(tmp_path, monkeypatch, hooks=Hooks(mem_auto=lambda st: "400G"))
+    monkeypatch.setenv("TT_PROCS", "512")
+    req = request(rt)
+    info = J.submit(rt, req, "a", {})
+    ln = sbatch_lines(req)
+    assert {"--ntasks=512", "--nodes=4", "--ntasks-per-node=128", "--ntasks-per-core=1", "--mem=100G"} <= set(ln)
+    assert "--nodes=1" not in ln
+    assert info["procs"] == 512 and info["nodes"] == 4 and info["ntasks_per_node"] == 128
+    assert info["mem"] == "100G" and info["mem_total"] == "400G" and "400G over 4 nodes" in info["mem_from"]
+    c = S.caps(rt)
+    assert c["procs"] == 512 and c["nodes"] == 4 and "128 x 4 nodes" in c["procs_from"] and c["mem_per"] == "node"
+    assert S.status_key(rt)["max_nodes"] == 4
+    assert S.run_errors(rt, {"run": {"procs": 513}}) and not S.run_errors(rt, {"run": {"procs": 512}})
+    monkeypatch.setenv("TT_PROCS", "300")                             # balanced: 3 x 100
+    J.submit(rt, req, "a", {})
+    assert {"--ntasks=300", "--nodes=3", "--ntasks-per-node=100", "--mem=136534M"}   # 400G / 3, rounded up <= set(sbatch_lines(req))
+    monkeypatch.setenv("TT_PROCS", "1000")                            # capped at 4 x 128
+    J.submit(rt, req, "a", {})
+    assert {"--ntasks=512", "--nodes=4"} <= set(sbatch_lines(req))
+    monkeypatch.setenv("TT_PROCS", "100")                             # fits one node: kept on one
+    info = J.submit(rt, req, "a", {})
+    assert {"--ntasks=100", "--nodes=1", "--mem=400G"} <= set(sbatch_lines(req)) and "nodes" not in info
+
+
+def test_multinode_mem_capped_per_node_and_given_mem_per_node(tmp_path, slurm, monkeypatch):
+    rt = multinode(tmp_path, monkeypatch, hooks=Hooks(mem_auto=lambda st: "4000G"))
+    monkeypatch.setenv("TT_PROCS", "256")
+    req = request(rt)
+    info = J.submit(rt, req, "a", {})
+    assert info["mem"] == "500G" and info["mem_capped_from"] == "2000G"     # 4000G / 2, capped at a node's
+    info = J.submit(rt, req, "a", {"run": {"mem": "64G"}})
+    assert info["mem"] == "64G" and info["mem_from"] == "run.mem"     # run.mem: per node, as given
+
+
+def test_one_node_and_default_stay_on_one_node(tmp_path, slurm, monkeypatch):
+    rt = multinode(tmp_path, monkeypatch, nodes="8", one_node=True)   # the translator's one_node wins
+    monkeypatch.setenv("TT_PROCS", "512")
+    req = request(rt)
+    J.submit(rt, req, "a", {})
+    assert {"--ntasks=128", "--nodes=1"} <= set(sbatch_lines(req)) and "procs" not in S.caps(rt)
+    assert S.max_nodes(rt) == 1 and S.status_key(rt)["max_nodes"] == 1
+    rt = multinode(tmp_path, monkeypatch, nodes=None)                 # P_SLURM_NODES unset: one node, lines as before
+    J.submit(rt, req, "a", {})
+    ln = sbatch_lines(req)
+    assert "--ntasks=128" in ln and not any(x.startswith("--nodes") for x in ln) and "procs" not in S.caps(rt)
+    rt = multinode(tmp_path, monkeypatch, nodes="99")                 # at most the nodes there are
+    assert S.max_nodes(rt) == 6 and S.max_job_procs(rt) == 768
+    monkeypatch.setenv("TT_SLURM_NODE", "nid001")                     # pinned to one node: one node
+    S.forget()
+    assert S.max_nodes(rt) == 1
+    rt = make_rt(tmp_path, kind="threads")                             # threads: one node whatever the setting
+    assert S.max_nodes(rt) == 1
+
+
+def test_nodes_from_constraint_and_partition(tmp_path, slurm, monkeypatch):
+    """A cluster with two kinds of nodes (Perlmutter: 64-core GPU nodes, 128-core CPU nodes): P_SLURM_ARGS'
+    --constraint / --partition choose which ones size the job, not the smallest of the cluster."""
+    f = tmp_path / "nodes.txt"
+    gpu = [f"NodeName=gpu{i} CoresPerSocket=64 CPUTot=128 Sockets=1 ThreadsPerCore=2 RealMemory=256000 "
+           f"AvailableFeatures=gpu,a100 Partitions=gpu_ss11 State=IDLE" for i in range(1, 3)]
+    cpu = [f"NodeName=nid{i} CoresPerSocket=64 CPUTot=256 Sockets=2 ThreadsPerCore=2 RealMemory=512000 "
+           f"AvailableFeatures=cpu Partitions=regular_milan_ss11 State=IDLE" for i in range(1, 5)]
+    f.write_text("\n".join(gpu + cpu))
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
+    monkeypatch.setenv("TT_SLURM_NODE", "any")
+    monkeypatch.setenv("TT_SLURM_NODES", "8")
+    rt = make_rt(tmp_path, kind="mpi")
+    S.forget()
+    assert S.node_cores(rt) == 64 and S.max_nodes(rt) == 6               # no filter: the smallest, every node
+    monkeypatch.setenv("TT_SLURM_ARGS", "-C cpu -q regular")
+    assert S.node_cores(rt) == 128 and S.max_nodes(rt) == 4 and S.max_job_procs(rt) == 512
+    assert S.job_layout(rt, 512) == (4, 128)
+    monkeypatch.setenv("TT_SLURM_ARGS", "--partition=gpu_ss11")
+    assert S.node_cores(rt) == 64 and S.max_nodes(rt) == 2
+    monkeypatch.setenv("TT_SLURM_ARGS", "-C 'cpu|gpu'")                  # an expression: SLURM decides, no filter
+    assert S.node_cores(rt) == 64 and S.max_nodes(rt) == 6
+    monkeypatch.setenv("TT_SLURM_ARGS", "-C knl")                         # matches none: every node
+    assert S.max_nodes(rt) == 6
+
+
+def test_job_setup_lines(rt, slurm, monkeypatch):
+    monkeypatch.setenv("TT_JOB_SETUP", "module load openfoam/2406\\nsource $FOAM_BASH")
+    req = request(rt)
+    J.submit(rt, req, "a", {})
+    text = (req / "a" / "job.sh").read_text().splitlines()
+    i = text.index("module load openfoam/2406")
+    assert text[i + 1] == "source $FOAM_BASH" and text[i + 2].startswith("export PYTHONPATH")
+    assert text[-1].startswith("exec ") and text[i - 1] == "#SBATCH --export=ALL"
+
+
 def test_hooks_shape_the_job(tmp_path, slurm):
     hooks = Hooks(procs=lambda st: 3, mem_auto=lambda st: "5G", time_need_min=lambda st: 77,
                   resource_lines=lambda st, p: [f"--ntasks={p}", "--gpus=1"], job_extra=lambda st: {"cells": 9})

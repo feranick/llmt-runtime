@@ -85,6 +85,11 @@ Shared code that translators still copy, or work around:
   - Two tests fail only on macOS, before and after the migration: `test_errors_reach_the_caller_as_tool_errors` (likely the MCP SDK version on the Mac) and `test_vehicle_aero_guide_and_ahmed_benchmarks` (snappy). Make them pass or skip where the dependency is missing.
   - The new bench test (`test_runtime.py`, the bench runs a case once) depends on timing: a 2 s sleep while the job is held. Watch it on loaded machines.
   - Drop `pending_ahead` (its extra `squeue` call per status): the runtime's `ahead_of` counts per node since 2026.11.09.7. Raise cfdt's floor to `>=2026.11.09.7`.
+- [ ] **cfdt: multi-node jobs (runtime 2026.11.11.1), for Perlmutter (S50 sliding mesh at 512 ranks).**
+  - Drop `one_node=True` from `runtime.py` (or keep it and set it from a setting): with it, jobs stay on one node whatever `CFDT_SLURM_NODES` says.
+  - `procs_for_job` and cfdt's own `caps()`/`node_cores()` cap ranks at one node's cores: use `S.max_job_procs(RT)` and the runtime's `caps` (`procs`, `procs_from`, `nodes`, `mem_per`).
+  - `mem_auto` stays the job's total: the runtime splits it over the nodes. Check the cell-based estimate scales with the ranks.
+  - Perlmutter's `config/env`: `CFDT_EXECUTOR=slurm`, `CFDT_SLURM_NODE=any`, `CFDT_SLURM_NODES=4` (or more), `CFDT_SLURM_ARGS="-C cpu -q regular -A <account>"`, `CFDT_JOB_SETUP="module load ...\nsource <OpenFOAM>/etc/bashrc"`.
 - [x] **lmpt (2026.11.09.6):** the `Pool.__del__` noise at the end of the suite (a session fixture stops `api._POOL`), `$USER` defaulted in `conftest.py`, and the subprocess tests keep `PYTHONPATH`.
 - [ ] **lmpt, next version:** `extend`, as its own version, following the outline under "`extend` beyond feat" in section 2.
 - [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.

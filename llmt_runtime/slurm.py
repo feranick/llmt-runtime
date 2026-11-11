@@ -1,11 +1,19 @@
 """slurm.py — the SLURM settings, the machine, caps, time limits and a call's time budget.
-Version: 2026.11.10.1
+Version: 2026.11.11.1
 
 Settings (P = the translator's prefix; llm-translators docs/EXECUTION.md):
     P_EXECUTOR local | slurm (local)        P_SLURM_MIN_MINUTES (rt.min_minutes): shorter studies run locally
     P_SLURM_ARGS: extra sbatch arguments, split as a shell does; a --mem there wins over P_SLURM_MEM, a --nodelist/-w
         over P_SLURM_NODE, a --partition/-p picks the partition whose limit 'max' takes
     P_SLURM_NODE local (default: --nodelist=<this node> when the cluster has several nodes) | any | a node list
+    P_SLURM_NODES the most nodes one MPI job may use (default 1; 1 for threaded translators and rt.one_node; at most
+        the nodes jobs may go to, so a multi-node machine sets P_SLURM_NODE=any or a node list). A job whose ranks
+        exceed a node's cores spans ceil(ranks / cores) nodes with the ranks balanced (job_layout); caps.procs is
+        then cores x nodes, and mem auto is split over the nodes (--mem is per node in SLURM). The nodes counted are
+        those of P_SLURM_ARGS' --partition and plain --constraint features (job_nodes), so a cluster with several
+        kinds of node (Perlmutter: '-C cpu') is sized by the right ones.
+    P_JOB_SETUP: shell lines written into job.sh before the command (module loads, the OpenFOAM bashrc), so jobs do
+        not depend on the submitting shell's environment; several lines separated by newlines or a literal '\n'.
     P_SLURM_MEM auto (default: the translator's estimate, rt.mem_default when unknown; never above the node's memory)
         | a size | none
     P_SLURM_TIME max | timeout | estimate | minutes (default rt.slurm_time_default):
@@ -134,10 +142,11 @@ def procs_of(rt, study: dict | None) -> int:
 
 
 def job_procs(rt, study: dict) -> int:
-    """What the job asks for: hooks.procs (the translator's size caps), else procs_of capped at the node's cores."""
+    """What the job asks for: hooks.procs (the translator's size caps), else procs_of capped at the node's cores (x
+    max_nodes when jobs may span nodes)."""
     if rt.hooks.procs:
         return max(1, int(rt.hooks.procs(study)))
-    return max(1, min(procs_of(rt, study), node_cores(rt)))
+    return max(1, min(procs_of(rt, study), max_job_procs(rt)))
 
 
 def queue_of(study: dict | None):
@@ -490,9 +499,28 @@ def node_status(rt) -> dict:
     return out
 
 
+def args_node_filter(rt) -> tuple[str | None, list[str]]:
+    """(partition, features every node must have) from P_SLURM_ARGS: --partition/-p, and a --constraint/-C of plain
+    features joined by '&' (or one); a constraint with '|', '[' or counts filters nothing (SLURM decides)."""
+    a = slurm_args(rt)
+    part = opt_value(a, ("--partition",), ("-p",))
+    con = opt_value(a, ("--constraint",), ("-C",)) or ""
+    feats = [] if not con or re.search(r"[|\[\]*()]", con) else [f.strip() for f in con.split("&") if f.strip()]
+    return (part.split(",")[0] if part and "," not in part else None), feats
+
+
 def job_nodes(rt) -> list[dict]:
-    """The nodes a job of this translator may run on: those of its nodelist, else every node ([] without SLURM)."""
+    """The nodes a job of this translator may run on: those of its nodelist, else every node ([] without SLURM); only
+    those of P_SLURM_ARGS' partition and constraint features when SLURM lists them (Perlmutter: '-C cpu' keeps the
+    128-core CPU nodes, not the 64-core GPU ones), unless that leaves none."""
     nodes = cluster_nodes() or []
+    part, feats = args_node_filter(rt)
+    if part or feats:
+        keep = [n for n in nodes
+                if (not part or "Partitions" not in n or part in (n.get("Partitions") or "").split(","))
+                and (not feats or "AvailableFeatures" not in n
+                     or set(feats) <= set((n.get("AvailableFeatures") or "").split(",")))]
+        nodes = keep or nodes
     nl = node_pin(rt)[1]
     if nl:
         want = set(expand_nodelist(nl))
@@ -504,7 +532,8 @@ def job_nodes(rt) -> list[dict]:
 
 def node_cores(rt) -> int:
     """Cores a job can use: the smallest node of a pinned nodelist, else this node (or the only one), else the
-    smallest of the cluster; without SLURM, this machine's CPUs. Caps use these, never the cluster's total."""
+    smallest of the nodes jobs may go to (job_nodes: P_SLURM_ARGS' partition and constraint); without SLURM, this
+    machine's CPUs. Caps use these, never the cluster's total."""
     nodes = cluster_nodes()
     if nodes:
         if node_pin(rt)[1]:
@@ -512,7 +541,7 @@ def node_cores(rt) -> int:
         me = this_node(nodes) or (nodes[0] if len(nodes) == 1 else None)
         if me:
             return node_core_count(me)
-        return min(node_core_count(n) for n in nodes)
+        return min(node_core_count(n) for n in (job_nodes(rt) or nodes))
     return max(1, os.cpu_count() or 1)
 
 
@@ -523,6 +552,48 @@ def node_mem_mb(rt) -> float | None:
         return None
     vals = [v for v in (node_real_mb(n) for n in job_nodes(rt)) if v]
     return max(vals) if vals else None
+
+
+def max_nodes(rt) -> int:
+    """The most nodes one job may use: P_SLURM_NODES (default 1); always 1 for threaded translators and rt.one_node;
+    at most the nodes jobs may go to (a pinned nodelist's, else the cluster's, when SLURM lists them)."""
+    if rt.kind != "mpi" or rt.one_node:
+        return 1
+    try:
+        n = max(1, int(float(rt.env("SLURM_NODES", "1") or 1)))
+    except ValueError:
+        return 1
+    if n > 1:
+        avail = len(job_nodes(rt))
+        if avail:
+            n = min(n, avail)
+    return n
+
+
+def max_job_procs(rt) -> int:
+    """The most ranks or threads one job can have: a node's cores (node_cores) x max_nodes."""
+    return node_cores(rt) * max_nodes(rt)
+
+
+def job_layout(rt, procs: int) -> tuple[int, int | None]:
+    """(nodes, ranks per node or None) of a job of `procs` ranks: (1, None) while they fit on a node's cores or the
+    job may use one node; else ceil(procs / cores) nodes (at most max_nodes) with the ranks balanced over them
+    (512 ranks on 128-core nodes: 4 x 128; 300: 3 x 100)."""
+    mx = max_nodes(rt)
+    if mx <= 1:
+        return 1, None
+    cores = node_cores(rt)
+    procs = max(1, int(procs))
+    if procs <= cores:
+        return 1, None
+    n = min(mx, int(math.ceil(procs / cores)))
+    return n, int(math.ceil(procs / n))
+
+
+def job_setup_lines(rt) -> list[str]:
+    """P_JOB_SETUP as job.sh lines (newlines or a literal '\\n' separate them; blank ones dropped)."""
+    v = rt.env("JOB_SETUP", "") or ""
+    return [ln.strip() for ln in v.replace("\\n", "\n").splitlines() if ln.strip()]
 
 
 def caps(rt) -> dict:
@@ -546,6 +617,16 @@ def caps(rt) -> dict:
         out["mem_from"] = "a node's memory (SLURM RealMemory)"
     if out.get("mem") and mem_mb(out["mem"]):
         out["mem_mb"] = int(mem_mb(out["mem"]))
+    nn = max_nodes(rt) if kind(rt) == "slurm" else 1
+    if nn > 1:                  # jobs may span nodes: the ranks one job can have (one node: as before, no cap here)
+        nc = node_cores(rt)
+        if not out.get("procs") or out["procs"] > nc * nn:
+            out["procs"] = nc * nn
+            out["procs_from"] = (f"a node's cores x {rt.var('SLURM_NODES')} ({nc} x {nn} nodes; SLURM, one rank per "
+                                 "core)")
+        out["nodes"] = nn
+        if out.get("mem"):
+            out["mem_per"] = "node"
     return out
 
 
@@ -582,10 +663,12 @@ def run_errors(rt, study: dict) -> list[str]:
 
 # ----------------------------------------------------------------------------- memory of a job
 
-def mem_plan(rt, study: dict | None) -> dict:
-    """{mem: the job's --mem or None (do not ask), from: where it comes from, capped_from?}: run.mem; else a --mem in
-    P_SLURM_ARGS (None here: sbatch gets it from the arguments); else P_SLURM_MEM none | a size | auto (the
-    translator's estimate, hooks.mem_auto, else rt.mem_default, never above the node's memory)."""
+def mem_plan(rt, study: dict | None, nodes: int | None = None) -> dict:
+    """{mem: the job's --mem or None (do not ask), from: where it comes from, capped_from?, total?}: run.mem; else a
+    --mem in P_SLURM_ARGS (None here: sbatch gets it from the arguments); else P_SLURM_MEM none | a size | auto (the
+    translator's estimate, hooks.mem_auto, else rt.mem_default, never above the node's memory). --mem is per node in
+    SLURM: run.mem and a size are taken as per node; auto's total is split over the job's nodes (nodes: given, else
+    job_layout's when jobs may span nodes), total says the whole."""
     r = run_of(study).get("mem")
     if r:
         return {"mem": mem_arg(r) or str(r).strip(), "from": "run.mem"}
@@ -599,6 +682,13 @@ def mem_plan(rt, study: dict | None) -> dict:
     auto = rt.hooks.mem_auto(study or {}) if rt.hooks.mem_auto else None
     out = {"mem": mem_arg(auto or rt.mem_default) or (auto or rt.mem_default),
            "from": "auto" if auto else f"auto ({rt.mem_default}: size unknown)"}
+    if nodes is None:
+        nodes = job_layout(rt, job_procs(rt, study or {}))[0] if max_nodes(rt) > 1 else 1
+    total = mem_mb(out["mem"])
+    if nodes > 1 and total:
+        out["total"] = out["mem"]
+        out["mem"] = mem_text(int(math.ceil(total / nodes)))
+        out["from"] += f", {out['total']} over {nodes} nodes"
     nm = node_mem_mb(rt)
     if nm and (mem_mb(out["mem"]) or 0) > nm:
         out["capped_from"], out["mem"] = out["mem"], mem_text(nm)
@@ -764,4 +854,5 @@ def status_key(rt) -> dict:
     return {"kind": kind(rt), "sbatch": shutil.which("sbatch"), "min_minutes": min_minutes(rt),
             "procs": default_procs(rt), "timeout_s": timeout_s(rt), "time_limit_min": need,
             "time": st, "slurm_time": st, "mem": rt.env("SLURM_MEM", "auto") or "auto", "caps": caps(rt),
-            "node": node_status(rt), "node_cores": node_cores(rt), "runtime": rt.runtime_version}
+            "node": node_status(rt), "node_cores": node_cores(rt), "max_nodes": max_nodes(rt),
+            "runtime": rt.runtime_version}

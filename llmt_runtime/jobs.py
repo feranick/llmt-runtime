@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.10.1
+Version: 2026.11.11.1
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -85,13 +85,19 @@ def job_name(rt, request: Path, name: str) -> str:
 
 def resource_lines(rt, study: dict, procs: int) -> list[str]:
     """The resource options (without '#SBATCH '): hooks.resource_lines, else by kind. threads: --ntasks=1
-    --cpus-per-task=N. mpi: --ntasks=N (--nodes=1 with rt.one_node) and --ntasks-per-core=1 (OpenMPI 5 refuses more
-    ranks than physical cores in the job's CPU set; mochi, cfdt), unless P_SLURM_ARGS already says how to place them."""
+    --cpus-per-task=N. mpi: --ntasks=N and --ntasks-per-core=1 (OpenMPI 5 refuses more ranks than physical cores in
+    the job's CPU set; mochi, cfdt), unless P_SLURM_ARGS already says how to place them; --nodes=1 with rt.one_node,
+    or when P_SLURM_NODES allows several and the ranks fit on one node; ranks beyond a node's cores: --nodes=K and a
+    balanced --ntasks-per-node (slurm.job_layout; 512 ranks on 128-core nodes: 4 x 128)."""
     if rt.hooks.resource_lines:
         return list(rt.hooks.resource_lines(study, procs))
     if rt.kind == "threads":
         return ["--ntasks=1", f"--cpus-per-task={procs}"]
-    out = [f"--ntasks={procs}"] + (["--nodes=1"] if rt.one_node else [])
+    nodes, per = S.job_layout(rt, procs)
+    if nodes > 1:
+        out = [f"--ntasks={procs}", f"--nodes={nodes}", f"--ntasks-per-node={per}"]
+    else:
+        out = [f"--ntasks={procs}"] + (["--nodes=1"] if rt.one_node or S.max_nodes(rt) > 1 else [])
     if not S.has_opt(S.slurm_args(rt), "--hint", "--threads-per-core", "--ntasks-per-core", "--cpus-per-task",
                      shorts=("-c",)):
         out.append("--ntasks-per-core=1")
@@ -105,11 +111,12 @@ def run_study_command(rt, request: Path, name: str) -> str:
 
 def job_script(rt, request: Path, name: str, study: dict, procs: int, time_limit: str, mem: str | None,
                nodelist: str | None) -> str:
-    """job.sh: the job's name, folder, log, resources, time, memory, node and environment, then the run-study line.
-    --mem is in the script (cfdt and omct passed it to sbatch only, so `sbatch job.sh` lost it)."""
+    """job.sh: the job's name, folder, log, resources, time, memory, node and environment, P_JOB_SETUP's lines, the
+    translator's (hooks.script_lines), then the run-study line. --mem is in the script (cfdt and omct passed it to
+    sbatch only, so `sbatch job.sh` lost it)."""
     request = Path(request)
     d = request / name
-    pre = list(rt.hooks.script_lines(request, name, study)) if rt.hooks.script_lines else []
+    pre = S.job_setup_lines(rt) + (list(rt.hooks.script_lines(request, name, study)) if rt.hooks.script_lines else [])
     return "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name(rt, request, name)}",
@@ -139,8 +146,9 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
     if time.time() < _SBATCH_DOWN["until"]:
         return {"ok": False, "why": f"could not submit: {_SBATCH_DOWN['why']}"}
     procs = S.job_procs(rt, study)
+    nodes, per_node = S.job_layout(rt, procs) if rt.kind == "mpi" and not rt.hooks.resource_lines else (1, None)
     t, tinfo = S.job_time(rt, study, estimate_min)
-    mplan = S.mem_plan(rt, study)
+    mplan = S.mem_plan(rt, study, nodes)
     add, nodelist, _ = S.node_pin(rt)
     script = d / "job.sh"
     script.write_text(job_script(rt, request, name, study, procs, t, mplan["mem"], add))
@@ -182,6 +190,10 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
             "command": cmd, "translator": rt.version, "runtime": rt.runtime_version}
     if mplan.get("capped_from"):
         info["mem_capped_from"] = mplan["capped_from"]
+    if nodes > 1:
+        info.update(nodes=nodes, ntasks_per_node=per_node, mem_per="node")
+        if mplan.get("total"):
+            info["mem_total"] = mplan["total"]
     if estimate_min is not None:
         info["estimate_min"] = round(float(estimate_min), 2)
     if after:

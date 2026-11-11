@@ -277,7 +277,7 @@ def test_deadline_bounds_commands(tmp_path, monkeypatch):
 def test_status_key(rt, slurm):
     k = S.status_key(rt)
     assert set(k) == {"kind", "sbatch", "min_minutes", "procs", "timeout_s", "time_limit_min", "time", "slurm_time",
-                      "mem", "caps", "node", "node_cores", "runtime"}
+                      "mem", "caps", "node", "node_cores", "max_nodes", "runtime"}
     assert k["kind"] == "slurm" and k["runtime"] == rt.runtime_version and k["time"] == "timeout"
 
 

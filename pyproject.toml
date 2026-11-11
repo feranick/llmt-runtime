@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "llmt-runtime"
-version = "2026.11.10.1"
+version = "2026.11.11.1"
 description = "The shared runtime of the llm-translators: worker processes, out-of-memory handling, the SLURM executor, request folders, the MCP server's stale-install handling"
 readme = "README.md"
 requires-python = ">=3.10"
