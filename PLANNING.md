@@ -90,6 +90,7 @@ Shared code that translators still copy, or work around:
   - `procs_for_job` and cfdt's own `caps()`/`node_cores()` cap ranks at one node's cores: use `S.max_job_procs(RT)` and the runtime's `caps` (`procs`, `procs_from`, `nodes`, `mem_per`).
   - `mem_auto` stays the job's total: the runtime splits it over the nodes. Check the cell-based estimate scales with the ranks.
   - Perlmutter's `config/env`: `CFDT_EXECUTOR=slurm`, `CFDT_SLURM_NODE=any`, `CFDT_SLURM_NODES=4` (or more), `CFDT_SLURM_ARGS="-C cpu -q regular -A <account>"`, `CFDT_JOB_SETUP="module load ...\nsource <OpenFOAM>/etc/bashrc"`.
+- [ ] **cfdt and omct: the memory cap's reason (runtime 2026.11.12.1).** Their own `caps()` (cfdt `executor.caps`, omct `format.caps`) get the right number through `S.node_mem_mb`, but still write `mem_from: "a node's memory (SLURM RealMemory)"`. Use `nm, why = S.node_mem_limit(RT)` and `mem_from = why` (or the runtime's `caps`). feat and lmpt use the runtime's `caps` and need nothing.
 - [x] **lmpt (2026.11.09.6):** the `Pool.__del__` noise at the end of the suite (a session fixture stops `api._POOL`), `$USER` defaulted in `conftest.py`, and the subprocess tests keep `PYTHONPATH`.
 - [ ] **lmpt, next version:** `extend`, as its own version, following the outline under "`extend` beyond feat" in section 2.
 - [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.

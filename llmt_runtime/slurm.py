@@ -1,5 +1,5 @@
 """slurm.py — the SLURM settings, the machine, caps, time limits and a call's time budget.
-Version: 2026.11.11.1
+Version: 2026.11.12.1
 
 Settings (P = the translator's prefix; llm-translators docs/EXECUTION.md):
     P_EXECUTOR local | slurm (local)        P_SLURM_MIN_MINUTES (rt.min_minutes): shorter studies run locally
@@ -32,7 +32,8 @@ Per study: "run": {"timeout_s", "mem", "procs", "queue"}.
 
 The machine: cluster_nodes() (scontrol -o show node: kept 60 s; a failure is asked again, but not within 5 s, so
 a dead controller costs one timeout per call), this_node(), node_pin() / node_status(), node_cores(), node_mem_mb()
-(RealMemory of the node jobs are pinned to, else the largest), caps() with it.
+(what a job can get per node: RealMemory less MemSpecLimit, within the partition's MaxMemPerNode and MaxMemPerCPU x
+CPUs; node_mem_limit says which), caps() with it.
 
 SLURM's start times: start_epoch(s); no_planned_start(s) for its one-year placeholder (NO_START_DAYS, NO_START_NOTE).
 
@@ -330,10 +331,14 @@ _NODES: dict = {"t": 0.0, "nodes": None, "failed": 0.0}
 _PART: dict = {"t": 0.0, "key": None, "v": None}
 
 
+_PARTS: dict = {"t": 0.0, "v": None, "failed": 0.0}
+
+
 def forget() -> None:
     """Drops what was learnt about the cluster (tests; after a configuration change)."""
     _NODES.update(t=0.0, nodes=None, failed=0.0)
     _PART.update(t=0.0, key=None, v=None)
+    _PARTS.update(t=0.0, v=None, failed=0.0)
 
 
 def cluster_nodes() -> list[dict] | None:
@@ -376,6 +381,65 @@ def node_core_count(n: dict) -> int:
         return max(1, cpus // max(1, int(n.get("ThreadsPerCore") or 1)))
     except ValueError:
         return max(1, cpus)
+
+
+def partitions() -> list[dict] | None:
+    """The cluster's partitions from `scontrol -o show partition`, one {key: value} each; kept and retried as
+    cluster_nodes; None when SLURM does not answer."""
+    now = time.time()
+    if _PARTS["v"] is not None and now - _PARTS["t"] < NODES_TTL:
+        return _PARTS["v"]
+    if now - _PARTS["failed"] < NODES_RETRY_S:
+        return None
+    p = run(["scontrol", "-o", "show", "partition"], timeout=10)
+    if p is None or p.returncode != 0:
+        _PARTS["failed"] = now
+        return None
+    v = [dict(re.findall(r"(\w+)=(\S*)", ln)) for ln in p.stdout.splitlines() if "PartitionName=" in ln]
+    _PARTS.update(t=now, v=v, failed=0.0)
+    return v
+
+
+def job_partition(rt) -> dict | None:
+    """The partition this translator's jobs go to: P_SLURM_ARGS' --partition/-p, else the default one (Default=YES);
+    None when SLURM does not say."""
+    parts = partitions() or []
+    want = args_node_filter(rt)[0]
+    for p in parts:
+        if (want and p.get("PartitionName") == want) or (not want and p.get("Default") == "YES"):
+            return p
+    return None
+
+
+def _mb_field(d: dict, key: str) -> float | None:
+    try:
+        v = float(d.get(key) or 0)
+    except ValueError:              # UNLIMITED, N/A
+        return None
+    return v if v > 0 else None
+
+
+def node_job_mb(n: dict, part: dict | None = None) -> tuple[float | None, str]:
+    """(MB, why) a job can get on one node: RealMemory less MemSpecLimit (the memory SLURM keeps for the system), and
+    no more than the partition's MaxMemPerNode or MaxMemPerCPU x the node's CPUs (CPUEfctv, else CPUTot) when set.
+    Perlmutter (RealMemory 515100M) refused --mem=480G: 'Memory required by task is not available'."""
+    real = node_real_mb(n)
+    if real is None:
+        return None, ""
+    mb, why = real, "a node's memory (SLURM RealMemory)"
+    spec = _mb_field(n, "MemSpecLimit")
+    if spec and spec < real:
+        mb, why = real - spec, f"a node's memory less MemSpecLimit (SLURM RealMemory {int(real)}M - {int(spec)}M)"
+    if part:
+        name = part.get("PartitionName", "?")
+        mpn = _mb_field(part, "MaxMemPerNode")
+        if mpn and mpn < mb:
+            mb, why = mpn, f"partition {name}'s MaxMemPerNode ({int(mpn)}M)"
+        mpc = _mb_field(part, "MaxMemPerCPU")
+        cpus = _mb_field(n, "CPUEfctv") or node_cpus(n)
+        if mpc and cpus and mpc * cpus < mb:
+            mb, why = mpc * cpus, f"partition {name}'s MaxMemPerCPU ({int(mpc)}M) x {int(cpus)} CPUs"
+    return mb, why
 
 
 def node_real_mb(n: dict) -> float | None:
@@ -545,13 +609,21 @@ def node_cores(rt) -> int:
     return max(1, os.cpu_count() or 1)
 
 
-def node_mem_mb(rt) -> float | None:
-    """The most memory one job can ask for (MB): the largest RealMemory among the nodes it may go to (its nodelist,
-    else the cluster); None without SLURM or when SLURM does not know it."""
+def node_mem_limit(rt) -> tuple[float | None, str]:
+    """(MB, why) of the most memory a job can ask for per node: the largest node_job_mb among the nodes it may go to
+    (RealMemory less MemSpecLimit, within the job's partition's MaxMemPerNode / MaxMemPerCPU x CPUs); (None, '')
+    without SLURM or when SLURM does not know it."""
     if kind(rt) != "slurm":
-        return None
-    vals = [v for v in (node_real_mb(n) for n in job_nodes(rt)) if v]
-    return max(vals) if vals else None
+        return None, ""
+    part = job_partition(rt) if job_nodes(rt) else None
+    vals = [v for v in (node_job_mb(n, part) for n in job_nodes(rt)) if v[0]]
+    return max(vals, key=lambda v: v[0]) if vals else (None, "")
+
+
+def node_mem_mb(rt) -> float | None:
+    """The most memory one job can ask for per node (MB): node_mem_limit's (before 2026.11.12.1 the largest RealMemory,
+    which Perlmutter refused); None without SLURM or when SLURM does not know it."""
+    return node_mem_limit(rt)[0]
 
 
 def max_nodes(rt) -> int:
@@ -611,10 +683,10 @@ def caps(rt) -> dict:
             pass
     if out.get("mem"):
         out["mem_from"] = rt.var("MAX_MEM")
-    nm = node_mem_mb(rt)
+    nm, why = node_mem_limit(rt)
     if nm and (not out.get("mem") or (mem_mb(out["mem"]) or 0) > nm):
         out["mem"] = mem_text(nm)
-        out["mem_from"] = "a node's memory (SLURM RealMemory)"
+        out["mem_from"] = why
     if out.get("mem") and mem_mb(out["mem"]):
         out["mem_mb"] = int(mem_mb(out["mem"]))
     nn = max_nodes(rt) if kind(rt) == "slurm" else 1
@@ -689,9 +761,9 @@ def mem_plan(rt, study: dict | None, nodes: int | None = None) -> dict:
         out["total"] = out["mem"]
         out["mem"] = mem_text(int(math.ceil(total / nodes)))
         out["from"] += f", {out['total']} over {nodes} nodes"
-    nm = node_mem_mb(rt)
+    nm, why = node_mem_limit(rt)
     if nm and (mem_mb(out["mem"]) or 0) > nm:
-        out["capped_from"], out["mem"] = out["mem"], mem_text(nm)
+        out["capped_from"], out["mem"], out["capped_by"] = out["mem"], mem_text(nm), why
     return out
 
 

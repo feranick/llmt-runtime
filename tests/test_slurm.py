@@ -183,7 +183,8 @@ def test_mem_plan(rt, slurm, monkeypatch):
     assert S.mem_plan(rt, {}) == {"mem": "8G", "from": "auto (8G: size unknown)"}
     rt.hooks.mem_auto = lambda st: f"{st['gb']}G"
     assert S.mem_plan(rt, {"gb": 12}) == {"mem": "12G", "from": "auto"}
-    assert S.mem_plan(rt, {"gb": 100}) == {"mem": "64000M", "from": "auto", "capped_from": "100G"}   # never above the node
+    assert S.mem_plan(rt, {"gb": 100}) == {"mem": "64000M", "from": "auto", "capped_from": "100G",   # never above the node
+                                           "capped_by": "a node's memory (SLURM RealMemory)"}
     assert S.mem_for(rt, {"run": {"mem": " 4G "}}) == "4G"
     monkeypatch.setenv("TT_SLURM_MEM", "none")
     assert S.mem_for(rt, {"gb": 3}) is None
@@ -338,3 +339,46 @@ def test_time_aliases(tmp_path, monkeypatch):
 def test_status_key_survives_a_hook_that_needs_a_study(rt):
     rt.hooks.time_need_min = lambda st: st["analysis"] and 5
     assert S.status_key(rt)["time_limit_min"] == 20
+
+
+PERLMUTTER_NODE = ("NodeName=nid001 CoresPerSocket=64 CPUTot=256 CPUEfctv=256 Sockets=2 ThreadsPerCore=2 "
+                   "RealMemory=515100 MemSpecLimit={spec} State=IDLE Partitions=regular_milan_ss11 AvailableFeatures=cpu")
+
+
+def test_mem_cap_is_what_a_job_can_get(tmp_path, rt, slurm, monkeypatch):
+    """Perlmutter (RealMemory 515100M) refused --mem=480G ('Memory required by task is not available'): the cap is
+    RealMemory less MemSpecLimit, within the partition's MaxMemPerNode and MaxMemPerCPU x CPUs; mem_from says which."""
+    nodes, parts = tmp_path / "nodes.txt", tmp_path / "parts.txt"
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(nodes))
+    monkeypatch.setenv("FAKE_SCONTROL_PARTITIONS", str(parts))
+
+    def setup(spec, part_line):
+        nodes.write_text(PERLMUTTER_NODE.format(spec=spec))
+        parts.write_text(part_line)
+        S.forget()
+
+    setup(0, "PartitionName=regular_milan_ss11 Default=YES MaxMemPerNode=UNLIMITED")
+    c = S.caps(rt)
+    assert c["mem"] == "515100M" and c["mem_from"] == "a node's memory (SLURM RealMemory)"
+    assert not S.run_errors(rt, {"run": {"mem": "480G"}})             # RealMemory alone let 480G through
+    setup(30000, "PartitionName=regular_milan_ss11 Default=YES MaxMemPerNode=UNLIMITED")
+    c = S.caps(rt)
+    assert c["mem_mb"] == 515100 - 30000 and "MemSpecLimit" in c["mem_from"] and "515100M - 30000M" in c["mem_from"]
+    assert S.run_errors(rt, {"run": {"mem": "480G"}})                 # 480G = 491520M > 485100M: refused here now
+    setup(0, "PartitionName=regular_milan_ss11 Default=YES MaxMemPerNode=460000")
+    c = S.caps(rt)
+    assert c["mem"] == "460000M" and c["mem_from"] == "partition regular_milan_ss11's MaxMemPerNode (460000M)"
+    assert S.run_errors(rt, {"run": {"mem": "480G"}})
+    setup(0, "PartitionName=other Default=NO MaxMemPerNode=1000\n"
+             "PartitionName=regular_milan_ss11 Default=YES MaxMemPerCPU=1900")
+    c = S.caps(rt)
+    assert c["mem_mb"] == 1900 * 256 and c["mem_from"] == "partition regular_milan_ss11's MaxMemPerCPU (1900M) x 256 CPUs"
+    monkeypatch.setenv("TT_SLURM_ARGS", "-p other")                  # the job's partition, not the default one
+    assert S.caps(rt)["mem_from"] == "partition other's MaxMemPerNode (1000M)"
+    monkeypatch.delenv("TT_SLURM_ARGS")
+    rt.hooks.mem_auto = lambda st: "600G"                              # mem_plan's cap is the same, and says why
+    plan = S.mem_plan(rt, {})
+    assert plan["mem"] == S.mem_text(1900 * 256) == "475G" and plan["capped_from"] == "600G" and "MaxMemPerCPU" in plan["capped_by"]
+    monkeypatch.setenv("FAKE_SCONTROL_FAIL", "1")                     # no partitions known: the node's own limit
+    S._PARTS.update(t=0.0, v=None, failed=0.0)
+    assert S.job_partition(rt) is None

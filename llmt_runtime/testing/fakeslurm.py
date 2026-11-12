@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fakeslurm.py — fake SLURM commands for tests: sbatch, squeue, scancel, sacct, sinfo, scontrol in one script, called
 by the name it is invoked as (or the name as its first argument). State lives in $FAKE_SLURM_DIR (jobs/<id>.json).
-Version: 2026.11.09.7
+Version: 2026.11.12.1
 
 Merged from fea-translator (tests/fake_slurm), cfd-translator, lammps-translator and openmodelica-translator.
 
@@ -24,6 +24,7 @@ Knobs (environment):
   FAKE_SACCT_FAIL=1             sacct fails (no accounting)
   FAKE_SCONTROL_NODES=file      `scontrol -o show node` prints its lines (default: one node fake1, 40 CPUs, 2 threads
                                 per core, 64000 MB)
+  FAKE_SCONTROL_PARTITIONS=file `scontrol -o show partition` prints its lines (default: none)
   FAKE_SCONTROL_FAIL=1          scontrol cannot reach the controller   FAKE_SCONTROL_DENY=1   scontrol update refused
   FAKE_SINFO_FAIL=1             sinfo fails
   FAKE_SINFO_PARTITIONS='long*|infinite;short|2:00:00'   sinfo -o '%P|%l' (unset: sinfo fails for that format)
@@ -339,6 +340,11 @@ def scontrol(args):
             rec = json.loads((J / f"{jid}.json").read_text())
             rec.setdefault("updates", []).append(args[1:])
             _save(jid, rec)
+        return 0
+    if "partition" in args:
+        f = os.environ.get("FAKE_SCONTROL_PARTITIONS")
+        if f:
+            print(Path(f).read_text().rstrip("\n"))
         return 0
     if "node" in args:
         f = os.environ.get("FAKE_SCONTROL_NODES")

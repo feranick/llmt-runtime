@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.11.2
+Version: 2026.11.12.1
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -193,6 +193,7 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
             "command": cmd, "translator": rt.version, "runtime": rt.runtime_version}
     if mplan.get("capped_from"):
         info["mem_capped_from"] = mplan["capped_from"]
+        info["mem_capped_by"] = mplan.get("capped_by")
     if nodes > 1:
         info.update(nodes=nodes, ntasks_per_node=per_node, mem_per="node")
         if mplan.get("total"):
