@@ -63,7 +63,7 @@ def test_waits_for_the_running_run_and_moves_with_its_next_job(rt, slurm, monkey
     assert jb["job_id"] and jb["run_after"][0]["folder"] == str(a / "a") and jb["after_mode"] == "any"
     assert f"--dependency=afterany:{ja}" in jb["command"] and "--hold" not in jb["command"]
     text = (b / "b" / "job.sh").read_text()
-    assert f"-m llmt_runtime.jobs gate {b / 'b'}; [ $? -eq {J.GATE_SKIP} ] && exit 0" in text
+    assert f"-m llmt_runtime.jobs gate {b / 'b'} || _llmt_gate=$?; [ \"$_llmt_gate\" -eq {J.GATE_SKIP} ] && exit 0" in text
     assert json.loads((a / "a" / J.WAITERS_FILE).read_text()) == [str(b / "b")]
     # A's job submits A's next job (a multi-job run): B now waits for that one (option a: scontrol update)
     monkeypatch.setenv("SLURM_JOB_ID", ja)
@@ -100,7 +100,8 @@ def test_job_sh_gate_end_to_end(rt, slurm, monkeypatch):
         time.sleep(0.2)
     assert J.result_path(rt, a, "a").is_file() and J.result_path(rt, b, "b").is_file()
     assert os.path.getmtime(J.result_path(rt, b, "b")) >= os.path.getmtime(J.result_path(rt, a, "a"))
-    assert J.read_job(b / "b").get("previous_jobs")                 # it waited again at least once
+    assert J.read_job(b / "b").get("waited_jobs")                   # it waited again at least once
+    assert "previous_jobs" not in J.read_job(b / "b")                # (cfdt's segments, not these)
     assert "has not finished: waiting again as job" in (b / "b" / "job.log").read_text()
 
 
@@ -127,7 +128,8 @@ def test_gate(rt, slurm, monkeypatch):
     # A still queued when B's job starts (a missed move): B waits again behind A's job, and does not run
     assert J.gate(b / "b", retries=1, pause=0) == J.GATE_SKIP
     jb2 = J.read_job(b / "b")
-    assert jb2["job_id"] != jb["job_id"] and jb2["previous_jobs"] == [jb["job_id"]]
+    assert jb2["job_id"] != jb["job_id"] and jb2["waited_jobs"] == [jb["job_id"]]
+    assert str(b / "b") in json.loads((a / "a" / J.WAITERS_FILE).read_text())   # registered again
     assert f"--dependency=afterany:{ja}" in jb2["command"]
     # A ends (scancel): with 'any', B runs; with 'ok', C is cancelled with the reason
     J.scancel([ja])
@@ -194,3 +196,85 @@ def test_cancel_takes_a_waiting_next_job_too(rt, slurm, monkeypatch):
     J.write_atomic(a / "a" / "job.json", json.dumps(dict(j, next_job={"job_id": nxt})))
     out = J.cancel_request(rt, a, json.loads((a / "request.json").read_text()), ["a"])
     assert sorted(out["cancelled_jobs"]) == sorted([ja, nxt])
+
+
+# ----------------------------------------------------------------------------- 2026.11.18.2
+
+
+def test_gate_line_is_safe_under_set_e(tmp_path):
+    """job.sh with `set -e` (P_JOB_SETUP or a translator's lines): exit 75 ends the job with 0 (COMPLETED, not
+    FAILED), and a gate that fails otherwise still lets the study run."""
+    import subprocess
+    import sys
+    for code, want in ((75, ("0", "")), (0, ("0", "ran")), (1, ("0", "ran"))):
+        fake = tmp_path / f"py{code}"
+        fake.write_text(f"#!/bin/sh\nexit {code}\n")
+        fake.chmod(0o755)
+        line = J.gate_line(tmp_path).replace(__import__("shlex").quote(sys.executable), str(fake))
+        p = subprocess.run(["bash", "-c", f"set -e\n{line}\necho ran"], capture_output=True, text=True)
+        assert (str(p.returncode), p.stdout.strip()) == want, (code, p.returncode, p.stdout, p.stderr)
+
+
+def test_job_end_moves_waiters_back_before_cancelling_the_next_job(rt, slurm, monkeypatch):
+    """afterany counts a cancel: a study waiting for the dropped next job must wait for the current job before the
+    next one is cancelled, or it could start while the current job still runs."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    a = request(rt, ["a", "n"])
+    ja = J.submit(rt, a, "a", {})["job_id"]
+    nxt = J.submit(rt, a, "n", {})["job_id"]
+    J.write_atomic(a / "a" / "job.json", json.dumps(dict(J.read_job(a / "a"), next_job={"job_id": nxt})))
+    b = request(rt, ["b"])
+    jb = J.submit(rt, b, "b", {"run": {"after": f"{a.name}/a"}})
+    assert sorted(jb["after_jobs"]) == sorted([ja, nxt])
+    order = []
+    real_scancel, real_notify = J.scancel, J.notify_waiters
+    monkeypatch.setattr(J, "scancel", lambda ids: order.append(("scancel", list(ids))) or real_scancel(ids))
+    monkeypatch.setattr(J, "notify_waiters", lambda *x, **k: order.append(("notify",)) or real_notify(*x, **k))
+    out = J.cancel_request(rt, a, json.loads((a / "request.json").read_text()), ["a"], at="job_end")
+    assert out["dropped_next"] == [nxt] and order[0] == ("notify",) and order[1] == ("scancel", [nxt])
+    assert J.read_job(a / "a")["next_job"]["dropped"]
+    assert J.read_job(b / "b")["after_jobs"] == [ja]
+    assert [f"JobId={jb['job_id']}", f"Dependency=afterany:{ja}"] in rec(slurm, jb["job_id"])["updates"]
+
+
+def test_a_refused_dependency_move_is_not_recorded(rt, slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    a = request(rt, ["a"])
+    ja = J.submit(rt, a, "a", {})["job_id"]
+    b = request(rt, ["b"])
+    jb = J.submit(rt, b, "b", {"run": {"after": f"{a.name}/a"}})
+    monkeypatch.setenv("FAKE_SCONTROL_DENY", "1")
+    ja2 = J.submit(rt, a, "a", {}, after=[ja])["job_id"]
+    jb2 = J.read_job(b / "b")
+    assert jb2["after_jobs"] == [ja] and "denied" in jb2["after_move_error"]
+    monkeypatch.delenv("FAKE_SCONTROL_DENY")
+    J.notify_waiters(rt, a, "a", ja2)                               # the next move succeeds and clears it
+    jb3 = J.read_job(b / "b")
+    assert jb3["after_jobs"] == [ja2] and "after_move_error" not in jb3
+    assert jb["job_id"] == jb3["job_id"]
+
+
+def test_selftest_slurm_on_the_fake_queue(tmp_path, slurm, monkeypatch, capsys):
+    """`python -m llmt_runtime.selftest slurm` with the fake SLURM honouring dependencies and holds: every step
+    passes, and the folder is removed."""
+    from llmt_runtime import selftest
+    monkeypatch.setenv("FAKE_DEPENDENCIES", "1")
+    monkeypatch.setenv("FAKE_MIN_JOB_AGE", "30")
+    monkeypatch.setenv("LLMT_SELFTEST_OUT", str(tmp_path / "st"))
+    monkeypatch.setenv("LLMT_SELFTEST_JOB_SETUP", "set -e")
+    monkeypatch.setenv("PYTHONPATH", str(Path(J.__file__).parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""))
+    rc = selftest.main(["slurm", "--seconds", "3", "--timeout-min", "1"])
+    out = capsys.readouterr().out
+    assert rc == 0, out
+    for step in ("slurm", "validate", "submit", "wait", "chain", "move", "hold", "release", "job_end", "gate",
+                 "finish"):
+        assert any(ln.startswith("PASS") and ln.split()[1] == step for ln in out.splitlines()), (step, out)
+    assert not list((tmp_path / "st").glob("run_*"))
+
+
+def test_selftest_reports_missing_slurm(tmp_path, monkeypatch, capsys):
+    from llmt_runtime import selftest
+    monkeypatch.setenv("PATH", str(tmp_path))
+    assert selftest.main(["slurm"]) == 1
+    assert "FAIL  slurm" in capsys.readouterr().out
+    assert selftest.main([]) == 2

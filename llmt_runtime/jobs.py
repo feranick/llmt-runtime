@@ -1,5 +1,6 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.18.1 (run.after: a study waits for other runs to finish; cancel at='job_end'; times with an offset)
+Version: 2026.11.18.2 (the gate safe under set -e and re-registering its study, waited_jobs, dependency moves checked,
+job_end moves waiters back; 2026.11.18.1: run.after, cancel at='job_end', times with an offset)
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -126,9 +127,12 @@ GATE_SKIP = 75        # gate's exit code for 'do not run now' (EX_TEMPFAIL); any
 def gate_line(folder: Path) -> str:
     """job.sh's check before a run.after study runs (gate): it ends the job (exit 0) only when the gate says so, i.e.
     a listed run has not really finished (the job waits again behind it) or, with after_mode 'ok', ended otherwise (the
-    study is cancelled). Any other outcome, a broken environment included, runs the study: late is worse than never."""
-    return (f"{shlex.quote(sys.executable)} -m llmt_runtime.jobs gate {shlex.quote(str(folder))}; "
-            f"[ $? -eq {GATE_SKIP} ] && exit 0")
+    study is cancelled). Any other outcome, a broken environment included, runs the study: late is worse than never.
+    Safe under `set -e` in P_JOB_SETUP or a translator's script lines (2026.11.18.2): the gate's code is caught by
+    `|| _llmt_gate=$?`, so neither 75 nor a failing gate ends job.sh with an error, and a job sent back to wait ends
+    COMPLETED (exit 0), not FAILED."""
+    return (f"_llmt_gate=0; {shlex.quote(sys.executable)} -m llmt_runtime.jobs gate {shlex.quote(str(folder))} "
+            f"|| _llmt_gate=$?; [ \"$_llmt_gate\" -eq {GATE_SKIP} ] && exit 0")
 
 
 def job_script(rt, request: Path, name: str, study: dict, procs: int, time_limit: str, mem: str | None,
@@ -477,12 +481,22 @@ def notify_waiters(rt, request: Path, name: str, new_job: str | None = None) -> 
             if new_job and str(new_job) not in ids and str(new_job) in tids:
                 ids.append(str(new_job))
             waiting_unsubmitted = any(target_state(t, qq)[0] == "unsubmitted" for t in j["run_after"])
+            moved = True
             if ids and ids != [str(x) for x in j.get("after_jobs") or []]:
-                S.run(["scontrol", "update", f"JobId={jid}", f"Dependency=afterany:{':'.join(ids)}"])
+                # SLURM 23+: a pending job's dependency may be replaced, held or not (a job id SLURM has already
+                # purged is refused: 'Job dependency problem'; the ids are those still in the queue)
+                p = S.run(["scontrol", "update", f"JobId={jid}", f"Dependency=afterany:{':'.join(ids)}"])
+                moved = p is not None and p.returncode == 0
+                if not moved:
+                    j["after_move_error"] = ((p.stderr or p.stdout).strip()[-200:] if p is not None
+                                             else "scontrol did not answer") + " (the gate in job.sh checks again)"
             if j.get("held") and not waiting_unsubmitted:
-                S.run(["scontrol", "release", str(jid)])
-                j["held"] = False
-            j["after_jobs"] = ids
+                p = S.run(["scontrol", "release", str(jid)])
+                if p is not None and p.returncode == 0:
+                    j["held"] = False
+            if moved:
+                j["after_jobs"] = ids
+                j.pop("after_move_error", None)
             write_atomic(wf / "job.json", json.dumps(j))
             done.append(str(jid))
         except Exception:  # noqa: BLE001 (a waiter's bookkeeping never fails the run's own submission)
@@ -515,6 +529,8 @@ def gate(folder: Path, retries: int = 5, pause: float = 30.0) -> int:
         time.sleep(pause)
     wait = [t for t, st, ok, what in states if st in ("active", "unsubmitted")]
     if wait:
+        for t in targets:                  # notify_waiters forgot this study when its job left the queue: again
+            _add_waiter(Path(t["folder"]), str(folder))
         ids = [i for t in wait for i in target_ids(Path(t["folder"]))]
         q = squeue(ids) or {}
         ids = [i for i in ids if i in q]
@@ -528,11 +544,23 @@ def gate(folder: Path, retries: int = 5, pause: float = 30.0) -> int:
               + (f"waiting again as job {new}" if new else f"could not wait again ({(p.stderr if p else '')[-200:]})"),
               flush=True)
         if new:
-            j.update(previous_jobs=list(j.get("previous_jobs") or []) + [str(j.get("job_id"))], job_id=new,
-                     after_jobs=ids, held=not ids, command=cmd)
+            # its own key: previous_jobs is a multi-job run's earlier segments (cfdt), not jobs sent back to wait
+            j.update(waited_jobs=list(j.get("waited_jobs") or []) + [str(j.get("job_id"))], job_id=new,
+                     after_jobs=ids, held=not ids, command=cmd, submitted=round(time.time(), 1))
             write_atomic(folder / "job.json", json.dumps(j))
+            notify_waiters(_Plain, folder.parent, folder.name, new)   # studies waiting for this one follow it
             return GATE_SKIP
-        return 0 if mode == "any" else GATE_SKIP
+        if mode == "any":
+            return 0
+        res = {"name": folder.name, "ok": False, "state": "failed",
+               "why": f"run.after {', '.join(t['ref'] for t in wait)} has not finished, and this job could not wait "
+                      f"again ({(p.stderr if p else 'sbatch did not answer')[-200:].strip()}); with after_mode 'ok' "
+                      f"it did not run: submit it again",
+               "translator": j.get("translator"), "execution": {"executor": "slurm", "slurm_job": j.get("job_id")}}
+        out = Path(j.get("result") or folder / f"{folder.name}.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(out, json.dumps(res))
+        return GATE_SKIP
     bad = [(t, what) for t, st, ok, what in states if mode == "ok" and not ok]
     if bad:
         t, what = bad[0]
@@ -999,9 +1027,20 @@ def stop_after_job(rt, request: Path, meta: dict, names: list[str] | None = None
             continue
         (d / STOP_FILE).write_text(str(time.time()))
         flagged.append(n)
-        nx = read_job(d).get("next_job") or {}
-        if nx.get("job_id") and not nx.get("dropped") and scancel([str(nx["job_id"])]) is None:
-            dropped.append(str(nx["job_id"]))
+        cur = read_job(d)
+        nx = cur.get("next_job") or {}
+        if nx.get("job_id") and not nx.get("dropped"):
+            # first marked dropped (as cfdt's drop_next does) and the studies waiting for this run moved back to its
+            # current job, then cancelled: afterany counts a cancel, so a study still waiting for the next job when it
+            # is cancelled could start at once, while this run's current job still runs
+            cur["next_job"] = dict(nx, dropped=round(time.time(), 1))
+            write_atomic(d / "job.json", json.dumps(cur))
+            notify_waiters(rt, request, n)
+            if scancel([str(nx["job_id"])]) is None:
+                dropped.append(str(nx["job_id"]))
+            else:                                   # it stays: the waiters follow it again
+                write_atomic(d / "job.json", json.dumps(dict(cur, next_job=nx)))
+                notify_waiters(rt, request, n)
     out = {"request": str(request), "stop_after_job": flagged,
            "note": "each flagged run ends with its current SLURM job (results at the time it reached) and chains no "
                    "next job; a new request can continue it"}

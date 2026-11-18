@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """fakeslurm.py — fake SLURM commands for tests: sbatch, squeue, scancel, sacct, sinfo, scontrol in one script, called
 by the name it is invoked as (or the name as its first argument). State lives in $FAKE_SLURM_DIR (jobs/<id>.json).
-Version: 2026.11.12.1
+Version: 2026.11.18.2
 
 Merged from fea-translator (tests/fake_slurm), cfd-translator, lammps-translator and openmodelica-translator.
 
@@ -30,6 +30,13 @@ Knobs (environment):
   FAKE_SINFO_PARTITIONS='long*|infinite;short|2:00:00'   sinfo -o '%P|%l' (unset: sinfo fails for that format)
   FAKE_SINFO_CPUS='2/6/0/8'     sinfo %C (sinfo -N: per node, one row per partition of FAKE_SINFO_PARTITIONS)
   FAKE_TIME_LEFT='1:00:00'      squeue %L
+  FAKE_DEPENDENCIES=1           sbatch --dependency=afterany:<ids> and --hold are honoured: the job stays PENDING
+                                (reason Dependency or JobHeldUser) until the ids have left the queue and it is not
+                                held; `scontrol update JobId=N Dependency=...` replaces (an empty value clears) them,
+                                `scontrol release N` lifts the hold, `scontrol show job -o N` prints JobState, Reason,
+                                Dependency (SLURM's 'afterany:7(unfulfilled)' or '(null)') and Priority (0 when held).
+                                Waiting jobs start when any fake command runs (2026.11.18.2; unset: as before, every
+                                job starts at once and dependencies are only recorded)
 A test changes a job's record (jobs/<id>.json) for the rest: "sacct": "OUT_OF_MEMORY" (what sacct says), "final":
 "TIMEOUT" (its final state in squeue and sacct), "vanished": true (gone from squeue), "state": "PENDING".
 Calls are counted in $FAKE_SLURM_DIR/calls/<command>.
@@ -155,10 +162,67 @@ def _opts(args: list[str], text: str) -> dict:
     return opt
 
 
+def _deps(text: str) -> list[str]:
+    """The job ids of an afterany/afterok/... dependency list ('afterany:7:8,afterok:9' -> ['7', '8', '9'])."""
+    out = []
+    for part in re.split(r"[,?]", text or ""):
+        out += [x.split("(")[0].split("+")[0] for x in part.split(":")[1:] if x.split("(")[0].strip()]
+    return out
+
+
+def _launch(jid: str, rec: dict) -> None:
+    """Starts job.sh in the background as the job (SLURM's environment variables, its log, its exit code)."""
+    delay = os.environ.get("FAKE_SBATCH_DELAY")
+    rc = J / f"{jid}.rc"
+    cmd = ["bash", "-c", (f"sleep {delay}; " if delay else "") + f"bash '{rec['script']}'; echo $? > '{rc}'"]
+    Path(rec["log"]).parent.mkdir(parents=True, exist_ok=True)
+    log = open(rec["log"], "a")
+    env = dict(os.environ, SLURM_JOB_ID=str(jid), SLURM_CPUS_PER_TASK=str(rec.get("cpt", 1)),
+               SLURM_NTASKS=str(rec.get("ntasks", 1)), SLURMD_NODENAME=rec.get("node", "fake1"))
+    env.pop("SLURM_MEM_PER_NODE", None)
+    if rec.get("mem") and _mem_mb(rec["mem"]):   # SLURM gives the job's --mem in MB
+        env["SLURM_MEM_PER_NODE"] = str(_mem_mb(rec["mem"]))
+    p = subprocess.Popen(cmd, cwd=rec.get("chdir"), stdout=log, stderr=subprocess.STDOUT, env=env,
+                         start_new_session=True)
+    rec["pid"] = p.pid
+    rec["t0"] = time.time()
+
+
+def _unfulfilled(rec: dict, jobs: dict) -> list[str]:
+    """A waiting job's dependencies that are still queued or running (afterany: any end fulfils one)."""
+    return [d for d in rec.get("dep") or [] if d in jobs and jobs[d].get("state") != "CANCELLED"
+            and (jobs[d].get("state") == "PENDING" or _alive(jobs[d].get("pid", 0)))]
+
+
+def _tick() -> None:
+    """FAKE_DEPENDENCIES: starts the waiting jobs whose dependencies have ended and that are not held."""
+    if not os.environ.get("FAKE_DEPENDENCIES"):
+        return
+    import fcntl
+    J.mkdir(parents=True, exist_ok=True)
+    with open(D / "tick.lock", "w") as lk:         # one command at a time starts them (no job twice)
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        _tick_locked()
+
+
+def _tick_locked() -> None:
+    jobs = _jobs()
+    for jid, rec in jobs.items():
+        if rec.get("deferred") and rec.get("state") == "PENDING" and not rec.get("held") \
+                and not _unfulfilled(rec, jobs):
+            rec.pop("state")
+            rec["deferred"] = False
+            _launch(jid, rec)
+            _save(jid, rec)
+
+
 def sbatch(args):
     s = os.environ.get("FAKE_SBATCH_SLEEP")
     if s:
         time.sleep(float(s))
+    if "--version" in args:
+        print(os.environ.get("FAKE_SLURM_VERSION", "slurm 23.11.4"))
+        return 0
     fail = os.environ.get("FAKE_SBATCH_FAIL")
     if fail:
         msg = fail if fail != "1" else "Batch job submission failed: Unable to contact slurm controller"
@@ -180,22 +244,16 @@ def sbatch(args):
            "log": opt.get("output", str(script.parent / f"slurm-{jid}.out")), "pid": 0, "args": args,
            "node": node, "prio": int(os.environ.get("FAKE_PRIORITY", "1000")), "mem": opt.get("mem"),
            "user": os.environ.get("USER", "user"), "time": opt.get("time"), "req": opt.get("nodelist") or ""}
+    rec.update(script=str(script), chdir=opt.get("chdir", str(script.parent)), ntasks=ntasks, cpt=cpus)
+    deps = _deps(opt.get("dependency", ""))
     if os.environ.get("FAKE_SBATCH_PENDING") or os.environ.get("FAKE_PENDING"):
         rec["state"] = "PENDING"
+    elif os.environ.get("FAKE_DEPENDENCIES") and (deps or "--hold" in args):
+        rec.update(state="PENDING", deferred=True, dep=deps, held="--hold" in args)
+        if rec["held"]:
+            rec["prio"] = 0
     else:
-        delay = os.environ.get("FAKE_SBATCH_DELAY")
-        rc = J / f"{jid}.rc"
-        cmd = ["bash", "-c", (f"sleep {delay}; " if delay else "") + f"bash '{script}'; echo $? > '{rc}'"]
-        Path(rec["log"]).parent.mkdir(parents=True, exist_ok=True)
-        log = open(rec["log"], "a")
-        env = dict(os.environ, SLURM_JOB_ID=str(jid), SLURM_CPUS_PER_TASK=str(cpus), SLURM_NTASKS=str(ntasks),
-                   SLURMD_NODENAME=node)
-        env.pop("SLURM_MEM_PER_NODE", None)
-        if rec["mem"] and _mem_mb(rec["mem"]):   # SLURM gives the job's --mem in MB
-            env["SLURM_MEM_PER_NODE"] = str(_mem_mb(rec["mem"]))
-        p = subprocess.Popen(cmd, cwd=opt.get("chdir", str(script.parent)), stdout=log, stderr=subprocess.STDOUT,
-                             env=env, start_new_session=True)
-        rec["pid"] = p.pid
+        _launch(str(jid), rec)
     _save(str(jid), rec)
     slow = os.environ.get("FAKE_SBATCH_SLOW_AFTER")      # the controller took the job, but answers late
     if slow:
@@ -207,7 +265,8 @@ def sbatch(args):
 def _fmt(fmt: str, jid: str, rec: dict, state: str) -> str:
     t0 = rec.get("t0", time.time())
     el = int(time.time() - t0)
-    vals = {"i": jid, "T": state, "r": "Priority" if state == "PENDING" else "None",
+    why = "JobHeldUser" if rec.get("held") else "Dependency" if rec.get("deferred") else "Priority"
+    vals = {"i": jid, "T": state, "r": why if state == "PENDING" else "None",
             "S": os.environ.get("FAKE_START", "N/A") if state == "PENDING" else time.strftime(
                 "%Y-%m-%dT%H:%M:%S", time.localtime(t0)),
             "M": f"{el // 60}:{el % 60:02d}", "j": rec.get("name", ""), "C": str(rec.get("cpus", 1)),
@@ -335,11 +394,41 @@ def scontrol(args):
         if os.environ.get("FAKE_SCONTROL_DENY"):
             print(f"Access/permission denied for {args[1] if len(args) > 1 else 'job'}", file=sys.stderr)
             return 1
-        jid = next((a.split("=", 1)[1] for a in args if a.startswith("JobId=")), None)
+        jid = next((a.split("=", 1)[1] for a in args if a.lower().startswith("jobid=")), None)
         if jid and (J / f"{jid}.json").is_file():
             rec = json.loads((J / f"{jid}.json").read_text())
             rec.setdefault("updates", []).append(args[1:])
+            dep = next((a.split("=", 1)[1] for a in args if a.lower().startswith("dependency=")), None)
+            if os.environ.get("FAKE_DEPENDENCIES") and dep is not None:
+                if rec.get("state") != "PENDING":
+                    print(f"Job is no longer pending execution for job {jid}", file=sys.stderr)
+                    return 1
+                rec.update(dep=_deps(dep), deferred=True)
             _save(jid, rec)
+        return 0
+    if args and args[0] == "release":
+        for jid in args[1:]:
+            f = J / f"{jid}.json"
+            if f.is_file():
+                rec = json.loads(f.read_text())
+                rec.update(held=False, prio=int(os.environ.get("FAKE_PRIORITY", "1000")))
+                rec.setdefault("updates", []).append(["release"])
+                _save(jid, rec)
+        _tick()
+        return 0
+    if args[:1] == ["-o"] and args[1:3] == ["show", "job"] or args[:2] == ["show", "job"]:
+        jid = args[-1]
+        jobs = _jobs()
+        rec = jobs.get(jid)
+        st = _state(rec, jid) if rec else None
+        if st is None:
+            print("slurm_load_jobs error: Invalid job id specified", file=sys.stderr)
+            return 1
+        un = _unfulfilled(rec, jobs) if st == "PENDING" else []
+        dep = ",".join(f"afterany:{d}(unfulfilled)" for d in un) or "(null)"
+        why = ("JobHeldUser" if rec.get("held") else "Dependency" if un else "Priority") if st == "PENDING" else "None"
+        print(f"JobId={jid} JobName={rec.get('name', '')} Priority={rec.get('prio', 1000)} JobState={st} "
+              f"Reason={why} Dependency={dep} ExitCode={_rc(jid) or 0}:0")
         return 0
     if "partition" in args:
         f = os.environ.get("FAKE_SCONTROL_PARTITIONS")
@@ -359,6 +448,7 @@ def main(argv: list[str]) -> int:
     if cmd not in NAMES and rest and rest[0] in NAMES:
         cmd, rest = rest[0], rest[1:]
     _count(cmd)
+    _tick()
     return {"sbatch": sbatch, "squeue": squeue, "scancel": scancel, "sacct": sacct, "sinfo": sinfo,
             "scontrol": scontrol}[cmd](rest)
 

@@ -1,6 +1,6 @@
 # Prompts for the translators' dev chats: what changed with llmt-runtime
 
-Paste the common part, then the translator's own section, at the start of that translator's chat. This was written 2026-11-09, after phases 1–3. When the runtime changes how translators use it, update this file.
+Paste the common part, then the translator's own section, at the start of that translator's chat. This was written 2026-11-09, after phases 1–3, brought up to date on 2026-11-12 (runtime 2026.11.12.1), and on 2026-11-18 (runtime 2026.11.18.2). When the runtime changes how translators use it, update this file.
 
 ---
 
@@ -9,7 +9,7 @@ Paste the common part, then the translator's own section, at the start of that t
 Since 2026-11-09 this translator runs on **llmt-runtime**, the package that holds the code the four translators used to copy:
 
 - **Repository:** `~/Software/llmt-runtime`, package `llmt_runtime`, a submodule of llm-translators.
-- **Versions at this writing:** runtime 2026.11.09.6; feat 2026.11.09.10, cfdt 2026.11.09.6, lmpt 2026.11.09.5, omct 2026.11.09.3.
+- **Versions at this writing:** runtime 2026.11.12.1; feat 2026.11.10.1, cfdt on multi-node jobs (floor 2026.11.11.1), lmpt 2026.11.09.6, omct 2026.11.09.3.
 - **Read first:** its `README.md` (API, hooks, settings, the versions table) and `PLANNING.md` (what is still open).
 
 **What is the runtime's now** (do not copy or re-implement it here):
@@ -73,6 +73,21 @@ Since 2026-11-09 this translator runs on **llmt-runtime**, the package that hold
   - The stale exit stops workers for at most 10 s.
   - The server log is in `$P_OUT/.server/`.
 - **Status:** `tool_status().executor.runtime`, and `study_status` reports the version a request ran with (`translator_now` when the server runs another).
+
+**Added since (2026-11-09 to 2026-11-12):**
+
+- **Queue position per node** (2026.11.09.7): `ahead` counts only pending jobs that can run on the same node (`pending_detail`, `ahead_of(..., share=)`). On the Sparks, spark1's jobs no longer count spark2's. cfdt dropped its own `pending_ahead`.
+- **No start time** (2026.11.10.1): SLURM's one-year placeholder start (behind a job with no time limit) is no estimate. `job_states` leaves `expected_start` out and adds `expected_start_note`; `squeue()` gives `start: "N/A"` and `start_note`. A translator that copies only some keys into its answers must copy `expected_start_note` too. The router reads the same placeholder from `sbatch --test-only` as no start.
+- **Jobs over several nodes** (2026.11.11.1, .2): `P_SLURM_NODES` (default 1) for MPI translators without `one_node`. Ranks beyond a node's cores get `--nodes=K` and a balanced `--ntasks-per-node`; `caps.procs` = cores × nodes; `mem` auto is split per node. Every one-node MPI job gets `--nodes=1`. `P_JOB_SETUP`: lines in `job.sh` before the command (`job.sh` has no strict mode). Which nodes count follows `P_SLURM_ARGS`' `--partition` and `--constraint`. cfdt uses it (Perlmutter); lmpt could, by dropping its node-cores cap in `ranks_for` for `S.max_job_procs(RT)`.
+- **Memory cap** (2026.11.12.1): what a job can get per node, not RealMemory: RealMemory less `MemSpecLimit`, within the partition's `MaxMemPerNode` / `MaxMemPerCPU` × CPUs. `S.node_mem_limit(RT)` gives (MB, why); `caps().mem_from` and `mem_plan`'s `capped_by` say which. A translator with its own `caps()` should take `mem_from` from it.
+
+**Added since (2026-11-12 to 2026-11-18):**
+
+- **`run.after`** (2026.11.18.1, .2): a study waits until other runs of this machine have ended (`"run": {"after": ..., "after_mode": "any" | "ok"}`). The runtime does the waiting, the moves to each new job of a chain, the gate in `job.sh` and the `waiting` state. A translator adds `"after"` and `"after_mode"` to its own `run` keys and calls `RT.jobs.after_problems(RT, request, name, study, studies)` in validation (in `validate_studies` with `request=None`, and when starting a request with its folder); floor `llmt-runtime>=2026.11.18.1`. Then add `"after_since": "<that release>"` to llm-translators' `translators.json`, or the router refuses `run.after` for it. cfdt does since 2026.11.18.3.
+- **`cancel(at="job_end")`** (2026.11.18.1): `RT.jobs.cancel_request(..., at=...)`; a translator's `cancel` tool may pass `at` through (the router supplies it otherwise).
+- **`clock()` ends with the UTC offset** (2026.11.18.1): `'19:38 (UTC)'`, `'07:15 (tomorrow, UTC-05:00)'`; `expected_start` carries the offset. Tests comparing exact clock strings compare with `RT.requests.clock()` of the same time.
+- **`set -e`** in `P_JOB_SETUP` or a translator's script lines is safe with the gate (2026.11.18.2).
+- **`llmt selftest slurm`** (2026.11.18.2): checks a machine's SLURM for all of the above, with no translator.
 
 ---
 
