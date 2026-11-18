@@ -264,12 +264,13 @@ def test_selftest_slurm_on_the_fake_queue(tmp_path, slurm, monkeypatch, capsys):
     monkeypatch.setenv("LLMT_SELFTEST_OUT", str(tmp_path / "st"))
     monkeypatch.setenv("LLMT_SELFTEST_JOB_SETUP", "set -e")
     monkeypatch.setenv("PYTHONPATH", str(Path(J.__file__).parents[1]) + os.pathsep + os.environ.get("PYTHONPATH", ""))
-    rc = selftest.main(["slurm", "--seconds", "3", "--timeout-min", "1"])
+    rc = selftest.main(["slurm", "--seconds", "5", "--timeout-min", "2"])      # a1: 10 s (also on a loaded node)
     out = capsys.readouterr().out
     assert rc == 0, out
     for step in ("slurm", "validate", "submit", "wait", "chain", "move", "hold", "release", "job_end", "gate",
                  "finish"):
-        assert any(ln.startswith("PASS") and ln.split()[1] == step for ln in out.splitlines()), (step, out)
+        line = next((ln for ln in out.splitlines() if ln[:4] in ("PASS", "SKIP", "FAIL") and ln.split()[1] == step), "")
+        assert line.startswith("PASS"), (step, line or out)
     assert not list((tmp_path / "st").glob("run_*"))
 
 

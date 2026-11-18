@@ -22,11 +22,11 @@ real queue. Each step prints PASS, FAIL or SKIP (could not be checked here, and 
                caught, the job ends COMPLETED with exit 0), job.json names the new job, jobs() does not say failed
     finish     all four end ok, in order (b after a, c after d), a2 never ran, no study reported failed
 
-It takes about 3 x --seconds plus the queue's wait; the folder (~/.llmt/selftest/run_<time>, or LLMT_SELFTEST_OUT)
+a runs 2 x --seconds, the others --seconds. It takes about 3 x --seconds plus the queue's wait; the folder (~/.llmt/selftest/run_<time>, or LLMT_SELFTEST_OUT)
 is removed when everything passed, unless --keep. --like CFDT takes CFDT_SLURM_ARGS and CFDT_SLURM_NODE (a
 partition, an account, the node rule) for its jobs; LLMT_SELFTEST_SLURM_ARGS sets them directly.
 Exit code: 0 when nothing failed, 1 otherwise, 2 for usage.
-Version: 2026.11.18.2
+Version: 2026.11.18.4
 """
 from __future__ import annotations
 
@@ -133,8 +133,10 @@ def slurm(seconds: float = 30, keep: bool = False, like: str | None = None, time
     req = root / time.strftime("run_%Y%m%d_%H%M%S")
     req.mkdir(parents=True, exist_ok=False)
     rt = make_runtime(root, like)
-    base = {"timeout_s": max(120, int(4 * seconds)), "mem": "200M"}
-    studies = {"a": {"seconds": seconds, "run": dict(base)},
+    base = {"timeout_s": max(120, int(6 * seconds)), "mem": "200M"}
+    # a runs twice as long: the gate step needs a1 still running after the steps before it (2026.11.18.4: on a
+    # loaded machine, mochi, those steps outlasted a 3 s a1 and the gate could not be checked)
+    studies = {"a": {"seconds": 2 * seconds, "run": dict(base)},
                "b": {"seconds": seconds, "run": dict(base, after="a")},
                "c": {"seconds": seconds, "run": dict(base, after="d", after_mode="ok")},
                "d": {"seconds": seconds, "run": dict(base)}}
