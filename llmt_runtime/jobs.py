@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.12.1
+Version: 2026.11.18.1 (run.after: a study waits for other runs to finish; cancel at='job_end'; times with an offset)
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
                                 job.json (the id, what was asked and why, the study's run settings)
@@ -9,6 +9,13 @@ Version: 2026.11.12.1
     cancel_request, scancel     cancel flags and scancel (the translator stops its local runs)
     extend_request, take_extension   more time for running studies: an 'extend' file the running solve consumes,
                                 and SLURM's limit only when the job's time left does not cover the new deadline
+    run.after                   a study waits until other runs (of this machine) have ended: after_problems for
+                                validation; submit waits for their newest jobs, notify_waiters moves the wait when they
+                                submit a next job, gate (job.sh's first step) checks before the study runs
+    stop_after_job, stop_requested   cancel(at='job_end'): the current job finishes, no next one is chained
+
+    python -m llmt_runtime.jobs gate <study folder>                  (job.sh of a run.after study)
+    python -m llmt_runtime.jobs stop-after-job <request> [names...]  (the router's cancel at='job_end')
 
 The state of a study never comes from this process, so it works after restarts and from other conversations. SLURM
 that does not answer is asked again next time, never taken for 'job gone'.
@@ -28,6 +35,7 @@ import uuid
 from pathlib import Path
 
 from . import slurm as S
+from .requests import with_offset
 
 FINAL = ("timed_out", "out_of_memory", "cancelled", "failed")
 QUEUED = ("PENDING", "CONFIGURING", "REQUEUED", "SUSPENDED", "REQUEUE_HOLD", "REQUEUE_FED", "RESV_DEL_HOLD")
@@ -112,14 +120,27 @@ def run_study_command(rt, request: Path, name: str) -> str:
             f"{shlex.quote(name)}")
 
 
+GATE_SKIP = 75        # gate's exit code for 'do not run now' (EX_TEMPFAIL); any other code lets the study run
+
+
+def gate_line(folder: Path) -> str:
+    """job.sh's check before a run.after study runs (gate): it ends the job (exit 0) only when the gate says so, i.e.
+    a listed run has not really finished (the job waits again behind it) or, with after_mode 'ok', ended otherwise (the
+    study is cancelled). Any other outcome, a broken environment included, runs the study: late is worse than never."""
+    return (f"{shlex.quote(sys.executable)} -m llmt_runtime.jobs gate {shlex.quote(str(folder))}; "
+            f"[ $? -eq {GATE_SKIP} ] && exit 0")
+
+
 def job_script(rt, request: Path, name: str, study: dict, procs: int, time_limit: str, mem: str | None,
-               nodelist: str | None) -> str:
+               nodelist: str | None, gate: bool = False) -> str:
     """job.sh: the job's name, folder, log, resources, time, memory, node and environment, P_JOB_SETUP's lines, the
-    translator's (hooks.script_lines), then the run-study line. --mem is in the script (cfdt and omct passed it to
-    sbatch only, so `sbatch job.sh` lost it)."""
+    translator's (hooks.script_lines), the run.after gate (gate), then the run-study line. --mem is in the script (cfdt
+    and omct passed it to sbatch only, so `sbatch job.sh` lost it)."""
     request = Path(request)
     d = request / name
     pre = S.job_setup_lines(rt) + (list(rt.hooks.script_lines(request, name, study)) if rt.hooks.script_lines else [])
+    if gate:
+        pre.append(gate_line(d))
     return "\n".join([
         "#!/bin/bash",
         f"#SBATCH --job-name={job_name(rt, request, name)}",
@@ -144,20 +165,29 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
     request = Path(request)
     d = request / name
     d.mkdir(parents=True, exist_ok=True)
+    me = os.environ.get("SLURM_JOB_ID")
+    if after and me and str(me) in [str(a) for a in after] and (d / STOP_FILE).is_file():
+        return {"ok": False, "stopped": True,             # a continuation, asked from inside the run's own job
+                "why": "stopped with its current job (cancel at='job_end'): no next job; a new request can continue it"}
     if not shutil.which("sbatch"):
         return {"ok": False, "why": f"could not submit: sbatch not found ({rt.var('EXECUTOR')}=slurm needs SLURM)"}
     if time.time() < _SBATCH_DOWN["until"]:
         return {"ok": False, "why": f"could not submit: {_SBATCH_DOWN['why']}"}
+    plan = after_plan(rt, request, name, study)           # run.after: wait for other runs to finish
+    if plan.get("refuse"):
+        return plan["refuse"]
     procs = S.job_procs(rt, study)
     nodes, per_node = S.job_layout(rt, procs) if rt.kind == "mpi" and not rt.hooks.resource_lines else (1, None)
     t, tinfo = S.job_time(rt, study, estimate_min)
     mplan = S.mem_plan(rt, study, nodes)
     add, nodelist, _ = S.node_pin(rt)
     script = d / "job.sh"
-    script.write_text(job_script(rt, request, name, study, procs, t, mplan["mem"], add))
+    script.write_text(job_script(rt, request, name, study, procs, t, mplan["mem"], add, gate=bool(plan.get("targets"))))
     script.chmod(0o755)
-    dep = [f"--dependency=afterany:{':'.join(str(a) for a in after)}"] if after else []
-    cmd = ["sbatch", "--parsable", *dep, *S.sbatch_args(rt, study), str(script)]
+    deps = [str(a) for a in after or []] + [i for i in plan.get("ids", []) if i not in [str(a) for a in after or []]]
+    dep = [f"--dependency=afterany:{':'.join(deps)}"] if deps else []
+    hold = ["--hold"] if plan.get("hold") else []
+    cmd = ["sbatch", "--parsable", *dep, *hold, *S.sbatch_args(rt, study), str(script)]
     left = S.remaining()
     if left is not None and left < 2:
         return {"ok": False, "why": "could not submit: SLURM was too slow to answer within this call; run the study "
@@ -202,6 +232,9 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
         info["estimate_min"] = round(float(estimate_min), 2)
     if after:
         info["after"] = list(after)
+    if plan.get("targets"):
+        info.update(run_after=plan["targets"], after_mode=plan["mode"], after_jobs=plan.get("ids", []),
+                    held=bool(plan.get("hold")), result=str(result_path(rt, request, name)))
     if adopted is not None:
         info["adopted"] = "sbatch timed out, but SLURM had taken the job: found by its name"
     try:
@@ -211,7 +244,349 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
         info["job_extra_error"] = f"{type(exc).__name__}: {exc}"[:200]
     info.update(extra or {})
     write_atomic(d / "job.json", json.dumps(info))
+    notify_waiters(rt, request, name, str(job_id))
     return info
+
+
+# ----------------------------------------------------------------------------- run.after: one run after another
+
+STOP_FILE = "stop_after_job"     # cancel(at='job_end'): the running job finishes, no next job is chained (cfdt's name)
+WAITERS_FILE = "waiters.json"    # in a run's study folder: the studies waiting for it (run.after)
+AFTER_MODES = ("any", "ok")
+
+
+def after_list(study: dict) -> tuple[list, str]:
+    """(refs, mode) of a study's run.after / run.after_mode ('any' by default)."""
+    r = S.run_of(study)
+    a = r.get("after")
+    refs = [a] if isinstance(a, str) else list(a) if isinstance(a, (list, tuple)) else []
+    return refs, str(r.get("after_mode") or "any")
+
+
+def ref_target(rt, request: Path, ref: str) -> tuple[Path, Path, str]:
+    """(request folder, study folder, study name) that a run.after ref names: '<study>' of the same request,
+    '<request>/<study>' under the output root, or an absolute study folder."""
+    ref = str(ref).strip().rstrip("/")
+    if "/" not in ref:
+        return Path(request), Path(request) / ref, ref
+    p = Path(ref).expanduser()
+    if not p.is_absolute():
+        p = rt.out_root() / p
+    return p.parent, p, p.name
+
+
+def _request_meta(req: Path) -> dict:
+    try:
+        return json.loads((Path(req) / "request.json").read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def _refs_of(rt, folder: Path) -> list[Path]:
+    """The study folders a (submitted or listed) study waits for: its job.json's run_after, else its request.json's
+    study run.after."""
+    j = read_job(folder)
+    if j.get("run_after"):
+        return [Path(t["folder"]) for t in j["run_after"]]
+    st = (_request_meta(folder.parent).get("studies") or {}).get(folder.name)
+    refs, _ = after_list(st if isinstance(st, dict) else {})
+    return [ref_target(rt, folder.parent, r)[1] for r in refs]
+
+
+def after_problems(rt, request: Path | None, name: str, study: dict, studies: dict | None = None) -> list[str]:
+    """What is wrong with a study's run.after / run.after_mode ([] when nothing): translators call it in validation
+    next to their run-key check (request: the request folder when it exists, else None; studies: the request's
+    {name: study}, for refs within it). A ref is '<request>/<study>' of this machine's output root, an absolute study
+    folder, or '<study>' of the same request; it must exist, must not be the study itself, and must not close a
+    cycle."""
+    r = S.run_of(study)
+    if r.get("after") is None:
+        return ["run.after_mode needs run.after"] if r.get("after_mode") is not None else []
+    refs, mode = after_list(study)
+    if not refs or not all(isinstance(x, str) and x.strip().strip("/") for x in refs):
+        return ["run.after: '<request>/<study>', '<study>' (same request), or a list of them"]
+    errs = []
+    if mode not in AFTER_MODES:
+        errs.append("run.after_mode: 'any' (default: start when they end, however they end) or 'ok' (start only if "
+                    "they all end ok; otherwise this study is cancelled)")
+    studies = studies or {}
+    for ref in refs:
+        if "/" not in ref.strip().rstrip("/"):
+            if ref == name:
+                errs.append(f"run.after {ref!r}: a study cannot wait for itself")
+            elif studies and ref not in studies:
+                errs.append(f"run.after {ref!r}: no study {ref!r} in this request (another request's: "
+                            f"'<request>/<study>')")
+            continue
+        req, folder, sname = ref_target(rt, request or rt.out_root(), ref)
+        if request is not None and folder.resolve() == (Path(request) / name).resolve():
+            errs.append(f"run.after {ref!r}: a study cannot wait for itself")
+            continue
+        listed = sname in (_request_meta(req).get("names") or [])
+        if not (listed or (folder / "job.json").is_file() or result_path(rt, req, sname).is_file()):
+            errs.append(f"run.after {ref!r}: no study {sname} in {req} on this machine (a run of another machine "
+                        f"cannot be waited for: run this study there)")
+    if errs:
+        return errs
+    # cycles: within this request (its studies' own refs), then through other requests' (submitted) studies
+    graph = {n: [x for x in after_list(s)[0] if "/" not in x.strip().rstrip("/")]
+             for n, s in studies.items() if isinstance(s, dict)}
+    graph[name] = [x for x in refs if "/" not in x.strip().rstrip("/")]
+    seen, path = set(), []
+
+    def loop(n):
+        if n in path:
+            return path[path.index(n):] + [n]
+        if n in seen:
+            return None
+        seen.add(n)
+        path.append(n)
+        for m in graph.get(n, []):
+            c = loop(m)
+            if c:
+                return c
+        path.pop()
+        return None
+    c = loop(name)
+    if c:
+        return ["run.after: a cycle (" + " -> ".join(c) + ")"]
+    if request is not None:
+        me = (Path(request) / name).resolve()
+        todo = [ref_target(rt, request, x)[1] for x in refs if "/" in x.strip().rstrip("/")]
+        visited = set()
+        while todo:
+            f = todo.pop()
+            k = str(Path(f).resolve())
+            if k in visited:
+                continue
+            visited.add(k)
+            if Path(f).resolve() == me:
+                return [f"run.after: a cycle (it comes back to {name} through {f.parent.name}/{f.name})"]
+            todo += _refs_of(rt, Path(f))
+    return []
+
+
+def target_ids(folder: Path) -> list[str]:
+    """A run's job ids that may still be queued or running: its job.json's job_id and a waiting next job
+    (next_job.job_id: a multi-job run that submits job k+1 while k runs, cfdt's chain 'together')."""
+    j = read_job(folder)
+    ids = [str(j["job_id"])] if j.get("job_id") else []
+    nx = (j.get("next_job") or {}).get("job_id")
+    if nx and not (j.get("next_job") or {}).get("dropped"):
+        ids.append(str(nx))
+    return ids
+
+
+def target_state(t: dict, q: dict | None) -> tuple[str, bool | None, str]:
+    """('final' | 'active' | 'unsubmitted' | 'unknown', ok, what) of a run.after target ({folder, result}); q: squeue
+    of its ids (None: SLURM did not answer)."""
+    res = Path(t["result"])
+    if res.is_file():
+        try:
+            r = json.loads(res.read_text())
+        except (OSError, ValueError):
+            r = {}
+        st = r.get("state") or ("done" if r.get("ok") else "done with ok false")
+        return "final", bool(r.get("ok")), st + (f": {str(r.get('why'))[:200]}" if r.get("why") and not r.get("ok")
+                                                  else "")
+    ids = target_ids(Path(t["folder"]))
+    if not ids:
+        return "unsubmitted", None, "not submitted yet"
+    if q is None:
+        return "unknown", None, "SLURM did not answer"
+    if any(i in q and (q[i]["state"] in QUEUED or q[i]["state"] in ACTIVE) for i in ids):
+        return "active", None, "running or queued"
+    return "final", False, "ended without a result"
+
+
+def after_plan(rt, request: Path, name: str, study: dict) -> dict:
+    """What submit needs for run.after: {targets, mode, ids (the listed runs' jobs it waits for), hold (a listed study of
+    this request is not submitted yet: held until it is)} or {refuse: submit's answer}. Registers the study in each
+    target's waiters.json, so the target's next job moves the wait (notify_waiters)."""
+    refs, mode = after_list(study)
+    if not refs:
+        return {}
+    probs = after_problems(rt, request, name, study, _request_meta(request).get("studies") or {})
+    if probs:
+        return {"refuse": {"ok": False, "why": "could not submit: " + "; ".join(probs)}}
+    targets = []
+    for ref in refs:
+        req, folder, sname = ref_target(rt, request, ref)
+        targets.append({"ref": ref, "request": str(req), "name": sname, "folder": str(folder),
+                        "result": str(result_path(rt, req, sname))})
+    me = str(Path(request) / name)
+    for t in targets:                      # before looking at their jobs: a job they submit meanwhile moves ours
+        _add_waiter(Path(t["folder"]), me)
+    all_ids = [i for t in targets for i in target_ids(Path(t["folder"]))]
+    q = squeue(all_ids) if all_ids else {}
+    ids, hold = [], False
+    for t in targets:
+        st, ok, what = target_state(t, q)
+        if st == "final" and mode == "ok" and not ok:
+            return {"refuse": {"ok": False, "state": "cancelled", "cancelled_by": "run.after",
+                               "why": f"cancelled: run.after {t['ref']} ended ({what}), and after_mode is 'ok'"}}
+        if st == "active":
+            ids += [i for i in target_ids(Path(t["folder"])) if i in q]
+        elif st in ("unsubmitted", "unknown"):
+            hold = True
+    return {"targets": targets, "mode": mode, "ids": list(dict.fromkeys(ids)), "hold": hold}
+
+
+def _add_waiter(folder: Path, waiter: str) -> None:
+    f = Path(folder) / WAITERS_FILE
+    try:
+        cur = json.loads(f.read_text()) if f.is_file() else []
+    except (OSError, ValueError):
+        cur = []
+    if waiter not in cur:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        write_atomic(f, json.dumps(cur + [waiter]))
+
+
+def notify_waiters(rt, request: Path, name: str, new_job: str | None = None) -> list[str]:
+    """A run submitted a job (or ended its submission): the studies waiting for it (waiters.json) now wait for its newest
+    job (scontrol update Dependency=afterany:<ids>), and a held one whose listed studies all have jobs, or have ended,
+    is released. Option (a) of cfdt's request (2026-11-18): a multi-job run submits each next job while (or after) the
+    current one runs, so a wait on the current job alone would let the waiting study start after the first job.
+    Returns the updated waiters' job ids. Never raises (the job is submitted)."""
+    f = Path(request) / name / WAITERS_FILE
+    try:
+        waiters = json.loads(f.read_text()) if f.is_file() else []
+    except (OSError, ValueError):
+        return []
+    done, keep = [], []
+    for w in waiters:
+        try:
+            wf = Path(w)
+            j = read_job(wf)
+            jid = j.get("job_id")
+            if not jid or not j.get("run_after") or Path(j.get("result", "")).is_file():
+                continue
+            q = squeue([str(jid)])
+            if q is None:
+                keep.append(w)
+                continue
+            if str(jid) not in q or q[str(jid)]["state"] not in QUEUED:
+                continue                       # started, ended or cancelled: nothing to move (the gate checks)
+            keep.append(w)
+            tids = {i for t in j["run_after"] for i in target_ids(Path(t["folder"]))}
+            own = [str(a) for a in j.get("after") or []]
+            qq = squeue(sorted(tids | set(own))) or {}
+            ids = [i for i in sorted(tids | set(own), key=lambda x: (len(x), x))
+                   if i in qq and (qq[i]["state"] in QUEUED or qq[i]["state"] in ACTIVE)]
+            if new_job and str(new_job) not in ids and str(new_job) in tids:
+                ids.append(str(new_job))
+            waiting_unsubmitted = any(target_state(t, qq)[0] == "unsubmitted" for t in j["run_after"])
+            if ids and ids != [str(x) for x in j.get("after_jobs") or []]:
+                S.run(["scontrol", "update", f"JobId={jid}", f"Dependency=afterany:{':'.join(ids)}"])
+            if j.get("held") and not waiting_unsubmitted:
+                S.run(["scontrol", "release", str(jid)])
+                j["held"] = False
+            j["after_jobs"] = ids
+            write_atomic(wf / "job.json", json.dumps(j))
+            done.append(str(jid))
+        except Exception:  # noqa: BLE001 (a waiter's bookkeeping never fails the run's own submission)
+            keep.append(w)
+    try:
+        write_atomic(f, json.dumps(keep))
+    except OSError:
+        pass
+    return done
+
+
+def gate(folder: Path, retries: int = 5, pause: float = 30.0) -> int:
+    """`python -m llmt_runtime.jobs gate <study folder>`: job.sh's first step for a run.after study (no translator code
+    needed: job.json holds the targets and the result's path). 0: every listed run has ended (and, with after_mode
+    'ok', ended ok): run the study. GATE_SKIP (75): do not run it now, because a listed run is still active (the job is submitted again,
+    waiting for it: a dependency that missed a move) or, with 'ok', one ended otherwise (the study's result says
+    'cancelled', with why)."""
+    folder = Path(folder)
+    j = read_job(folder)
+    targets, mode = j.get("run_after") or [], j.get("after_mode") or "any"
+    if not targets:
+        return 0
+    states = []
+    for attempt in range(max(1, retries)):
+        ids = [i for t in targets for i in target_ids(Path(t["folder"]))]
+        q = squeue(ids) if ids else {}
+        states = [(t, *target_state(t, q)) for t in targets]
+        if not any(s[1] == "unknown" for s in states):
+            break
+        time.sleep(pause)
+    wait = [t for t, st, ok, what in states if st in ("active", "unsubmitted")]
+    if wait:
+        ids = [i for t in wait for i in target_ids(Path(t["folder"]))]
+        q = squeue(ids) or {}
+        ids = [i for i in ids if i in q]
+        cmd = [x for x in j.get("command") or ["sbatch", "--parsable", str(folder / "job.sh")]
+               if not x.startswith("--dependency") and x != "--hold"]
+        cmd[2:2] = [f"--dependency=afterany:{':'.join(ids)}"] if ids else ["--hold"]
+        p = S.run(cmd, timeout=SBATCH_TIMEOUT)
+        new = p.stdout.strip().splitlines()[-1].split(";")[0].strip() if p is not None and p.returncode == 0 and \
+            p.stdout.strip() else None
+        print(f"run.after: {', '.join(t['ref'] for t in wait)} has not finished: "
+              + (f"waiting again as job {new}" if new else f"could not wait again ({(p.stderr if p else '')[-200:]})"),
+              flush=True)
+        if new:
+            j.update(previous_jobs=list(j.get("previous_jobs") or []) + [str(j.get("job_id"))], job_id=new,
+                     after_jobs=ids, held=not ids, command=cmd)
+            write_atomic(folder / "job.json", json.dumps(j))
+            return GATE_SKIP
+        return 0 if mode == "any" else GATE_SKIP
+    bad = [(t, what) for t, st, ok, what in states if mode == "ok" and not ok]
+    if bad:
+        t, what = bad[0]
+        res = {"name": folder.name, "ok": False, "state": "cancelled", "cancelled_by": "run.after",
+               "why": f"cancelled: run.after {t['ref']} ended ({what}), and after_mode is 'ok'",
+               "translator": j.get("translator"), "execution": {"executor": "slurm", "slurm_job": j.get("job_id")}}
+        out = Path(j.get("result") or folder / f"{folder.name}.json")
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_atomic(out, json.dumps(res))
+        print(res["why"], flush=True)
+        return GATE_SKIP
+    return 0
+
+
+def waiting_detail(rt, j: dict) -> dict | None:
+    """For a queued run.after study: {state: 'waiting', reason, expected_start?} while a listed run has not ended; None
+    once all have. The reason says how far the listed runs are (hooks.running_progress: time t of end_time, eta)."""
+    from .requests import clock, iso
+    targets = j.get("run_after") or []
+    if not targets:
+        return None
+    ids = [i for t in targets for i in target_ids(Path(t["folder"]))]
+    q = squeue(ids) if ids else {}
+    parts, ends = [], []
+    for t in targets:
+        st, ok, what = target_state(t, q)
+        if st == "final":
+            continue
+        bits = [what if st != "active" else
+                ("running" if any(q and i in q and q[i]["state"] in ACTIVE for i in target_ids(Path(t["folder"])))
+                 else "queued")]
+        pr = {}
+        if rt.hooks.running_progress and bits[0] == "running":
+            try:
+                study = (_request_meta(Path(t["request"])).get("studies") or {}).get(t["name"], {})
+                pr = rt.hooks.running_progress(Path(t["folder"]), study) or {}
+            except Exception:  # noqa: BLE001
+                pr = {}
+        tm, end = pr.get("time"), pr.get("end_time")
+        if isinstance(tm, (int, float)) and isinstance(end, (int, float)):
+            bits.append(f"t = {tm:.3g} of {end:.3g} s")
+        eta = pr.get("eta_min") if pr.get("eta_min") is not None else pr.get("eta_min_max")
+        if isinstance(eta, (int, float)):
+            ends.append(time.time() + 60 * float(eta))
+            bits.append(f"expected finish {clock(ends[-1])}")
+        else:
+            ends.append(None)
+        parts.append(f"{t['ref']} ({', '.join(bits)})")
+    if not parts:
+        return None
+    rec = {"state": "waiting", "reason": f"after {'; '.join(parts)}"}
+    if ends and all(e is not None for e in ends):
+        rec["expected_start"] = iso(max(ends))
+    return rec
 
 
 def find_job(name: str) -> str | None:
@@ -233,12 +608,17 @@ def job_timeout_s(folder: Path, default: float) -> float:
 
 
 def failed_submission(rt, request: Path, name: str, info: dict, **keys) -> dict:
-    """Writes a failed submission as the study's result ({ok: false, state: failed, why, execution}) and returns it."""
-    res = {"name": name, "ok": False, "state": "failed", "why": info.get("why", "could not submit"),
+    """Writes a failed submission as the study's result ({ok: false, state: failed, why, execution}) and returns it.
+    A study run.after cancelled at submission (after_mode 'ok', a listed run ended otherwise) keeps state 'cancelled'.
+    Studies waiting for this one (run.after) are told: it has ended."""
+    res = {"name": name, "ok": False, "state": info.get("state", "failed"), "why": info.get("why", "could not submit"),
            "execution": {"executor": "slurm", "slurm_job": None}, "translator": rt.version, **keys}
+    if info.get("cancelled_by"):
+        res["cancelled_by"] = info["cancelled_by"]
     f = result_path(rt, request, name)
     f.parent.mkdir(parents=True, exist_ok=True)
     write_atomic(f, json.dumps(res))
+    notify_waiters(rt, request, name)
     return res
 
 
@@ -436,6 +816,12 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
     for n in names:
         if result_path(rt, request, n).is_file():
             out[n] = {"state": "done", "job_id": read_job(request / n).get("job_id")}
+            try:                       # a run.after study cancelled because a listed run did not end ok
+                r = json.loads(result_path(rt, request, n).read_text())
+                if r.get("cancelled_by") == "run.after":
+                    out[n].update(state="cancelled", why=r.get("why"))
+            except (OSError, ValueError):
+                pass
             continue
         j = read_job(request / n)
         if j.get("job_id"):
@@ -466,10 +852,16 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
             if st["state"] in QUEUED:
                 rec = {"state": "queued", "job_id": jid, "reason": st["reason"]}
                 if st["start"] and st["start"] not in ("N/A", "Unknown", "None"):
-                    rec["expected_start"] = st["start"]
+                    rec["expected_start"] = with_offset(st["start"])     # SLURM's time, with this machine's offset
                 elif st.get("start_note"):
                     rec["expected_start_note"] = st["start_note"]
                 rec["ahead"] = ahead_of(jid, pend) if pend is not None else None
+                w = waiting_detail(rt, j) if j.get("run_after") else None
+                if w:                           # run.after: waiting for other runs, with how far they are
+                    rec.update(w)
+                    rec.pop("ahead", None)
+                    if "expected_start" not in w:
+                        rec.pop("expected_start", None)
             else:
                 rec = {"state": "running", "job_id": jid, "job_elapsed_min": st["elapsed_min"]}
                 if st.get("node"):
@@ -557,7 +949,7 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
                         "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
             continue
         st = job_states(rt, d, names)
-        if active and not any(v["state"] in ("queued", "running", "unknown") for v in st.values()):
+        if active and not any(v["state"] in ("queued", "waiting", "running", "unknown") for v in st.values()):
             continue
         studies = {}
         for n, v in st.items():
@@ -580,10 +972,55 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
     return {"translator": rt.version, "executor": S.kind(rt), "requests": out, **queue_summary(rt)}
 
 
-def cancel_request(rt, request: Path, meta: dict, names: list[str] | None = None) -> dict:
+def stop_requested(folder: Path) -> bool:
+    """cancel(at='job_end') asked this run to end with its current job (no next job)."""
+    return (Path(folder) / STOP_FILE).is_file()
+
+
+def stop_after_job(rt, request: Path, meta: dict, names: list[str] | None = None) -> dict:
+    """cancel(at='job_end'): a stop_after_job flag in each unfinished SLURM study's folder. The running job finishes
+    (its results at the time reached) and submit() chains no next job from inside it; a next job already waiting for
+    it (next_job, a 'together' chain) is cancelled. A study queued but not started runs its one job, then stops. The run
+    stays resumable (a new request continues it). Returns {request, stop_after_job, dropped_next?, not_flagged?}."""
+    request = Path(request)
+    known = list(meta.get("names", []))
+    want = list(names) if names else known
+    unknown = [n for n in want if n not in known]
+    if unknown:
+        return {"error": f"no studies {unknown} in this request ({known})"}
+    flagged, skipped, dropped = [], {}, []
+    for n in want:
+        d = request / n
+        if result_path(rt, request, n).is_file():
+            skipped[n] = "finished"
+            continue
+        if not (d / "job.json").is_file():
+            skipped[n] = "not a SLURM job: cancel without 'at' stops it now"
+            continue
+        (d / STOP_FILE).write_text(str(time.time()))
+        flagged.append(n)
+        nx = read_job(d).get("next_job") or {}
+        if nx.get("job_id") and not nx.get("dropped") and scancel([str(nx["job_id"])]) is None:
+            dropped.append(str(nx["job_id"]))
+    out = {"request": str(request), "stop_after_job": flagged,
+           "note": "each flagged run ends with its current SLURM job (results at the time it reached) and chains no "
+                   "next job; a new request can continue it"}
+    if dropped:
+        out["dropped_next"] = dropped
+    if skipped:
+        out["not_flagged"] = skipped
+    return out
+
+
+def cancel_request(rt, request: Path, meta: dict, names: list[str] | None = None, at: str | None = None) -> dict:
     """The common part of cancel(): a cancel flag in each unfinished study's folder (the translator's runner checks
-    it, in any process) and scancel for its SLURM jobs. Returns {want, todo, slurm, cancelled_jobs, already_finished,
-    error?} or {error} for unknown names; the translator then stops its own local runs and reports the states."""
+    it, in any process) and scancel for its SLURM jobs, a waiting next job (next_job) included. Returns {want, todo,
+    slurm, cancelled_jobs, already_finished, error?} or {error} for unknown names; the translator then stops its own
+    local runs and reports the states. at='job_end': stop_after_job instead (the current jobs finish)."""
+    if at not in (None, "now", "job_end"):
+        return {"error": f"at: 'now' (default) or 'job_end', not {at!r}"}
+    if at == "job_end":
+        return stop_after_job(rt, request, meta, names)
     request = Path(request)
     known = list(meta.get("names", []))
     want = list(names) if names else known
@@ -595,7 +1032,7 @@ def cancel_request(rt, request: Path, meta: dict, names: list[str] | None = None
         (request / n).mkdir(parents=True, exist_ok=True)
         (request / n / rt.cancel_file).write_text(str(time.time()))
     slurm = [n for n in todo if n in meta.get("slurm", []) or (request / n / "job.json").is_file()]
-    ids = [j["job_id"] for j in (read_job(request / n) for n in slurm) if j.get("job_id")]
+    ids = [i for n in slurm for i in target_ids(request / n)]      # the job, and a next job waiting for it
     out = {"want": want, "todo": todo, "slurm": slurm, "cancelled_jobs": ids,
            "already_finished": [n for n in want if n not in todo]}
     err = scancel(ids)
@@ -689,3 +1126,32 @@ def extend_request(rt, request: Path, meta: dict, studies: dict, hours: float, n
         rec["note"] = "the running solve takes it within seconds (extended.json records it)"
         out["studies"][n] = rec
     return out
+
+
+# ----------------------------------------------------------------------------- command line
+
+class _Plain:
+    """A stand-in runtime for the command line (no translator loaded): default result files."""
+    class hooks:  # noqa: N801
+        result_file = None
+
+
+def main(argv: list[str]) -> int:
+    if argv[:1] == ["gate"] and len(argv) == 2:
+        return gate(Path(argv[1]))
+    if argv[:1] == ["stop-after-job"] and len(argv) >= 2:
+        req = Path(argv[1]).expanduser()
+        meta = _request_meta(req)
+        if not meta:
+            print(json.dumps({"error": f"no request {req}"}))
+            return 1
+        out = stop_after_job(_Plain, req, meta, argv[2:] or None)
+        print(json.dumps(out))
+        return 1 if out.get("error") else 0
+    print("usage: python -m llmt_runtime.jobs gate <study folder> | stop-after-job <request> [names...]",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

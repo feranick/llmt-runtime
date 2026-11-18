@@ -1,5 +1,5 @@
 """slurm.py — the SLURM settings, the machine, caps, time limits and a call's time budget.
-Version: 2026.11.12.1
+Version: 2026.11.18.1
 
 Settings (P = the translator's prefix; llm-translators docs/EXECUTION.md):
     P_EXECUTOR local | slurm (local)        P_SLURM_MIN_MINUTES (rt.min_minutes): shorter studies run locally
@@ -286,11 +286,19 @@ NO_START_NOTE = ("SLURM gives no start time: a job ahead of it (or running on th
 
 
 def start_epoch(s: str | None) -> float | None:
-    """SLURM's start time (local ISO time, e.g. 2026-10-18T22:22:27) as epoch seconds; None for N/A, Unknown, None."""
+    """SLURM's start time (local ISO time, e.g. 2026-10-18T22:22:27; with an offset too, as the runtime reports it since
+    2026.11.18.1: 2026-10-18T22:22:27+00:00) as epoch seconds; None for N/A, Unknown, None."""
     if not s:
         return None
+    s = s.strip()
+    if len(s) > 19 and s[10:11] == "T":
+        try:
+            import datetime as _dt
+            return _dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
     try:
-        return time.mktime(time.strptime(s.strip(), "%Y-%m-%dT%H:%M:%S"))
+        return time.mktime(time.strptime(s, "%Y-%m-%dT%H:%M:%S"))
     except ValueError:
         return None
 

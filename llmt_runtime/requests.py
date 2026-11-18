@@ -1,6 +1,6 @@
 """requests.py — request folders, request names chosen by the caller, the version a request ran with, files under the
 output root, and the time left as clock times.
-Version: 2026.11.10.1
+Version: 2026.11.18.1
 
     new_request(prefix, request_name)  <out>/<prefix>_<YYYYmmdd_HHMMSS>_<hex6>, or <out>/<request_name>
     check_request_name(name)    ('new' | 'repeat' | 'error', detail): a repeated name returns that request's status,
@@ -8,7 +8,8 @@ Version: 2026.11.10.1
     request_meta(**keys)        request.json's content with "translator" (and "runtime") recorded at submission
     ran_with(meta, results)     {"translator": the version the studies ran with, "translator_now"?: this server's}
     read_file(path), under_root(path)   only files under the output root
-    clock(t), slurm_start(s)    'HH:MM (tomorrow)'; SLURM's expected start as epoch seconds
+    clock(t), slurm_start(s)    'HH:MM (tomorrow, UTC-05:00)'; SLURM's expected start as epoch seconds
+    iso(t), with_offset(s), utc_offset()   times with this machine's UTC offset (2026-11-17T19:38:17+00:00)
     timing_slurm(...), timing_local(...)   the request's time_left and 'next'
 """
 from __future__ import annotations
@@ -120,13 +121,36 @@ def image_path(rt, path: str, suffixes: tuple = (".png",)) -> Path:
 
 # ----------------------------------------------------------------------------- times
 
+def utc_offset(t: float | None = None) -> str:
+    """This machine's offset from UTC at time t: 'UTC', 'UTC-05:00', 'UTC+05:30'."""
+    off = dt.datetime.fromtimestamp(time.time() if t is None else t).astimezone().utcoffset() or dt.timedelta(0)
+    m = int(off.total_seconds() // 60)
+    return "UTC" if m == 0 else f"UTC{'+' if m > 0 else '-'}{abs(m) // 60:02d}:{abs(m) % 60:02d}"
+
+
 def clock(t: float, now: float | None = None) -> str:
-    """A local clock time, with its day when it is not today: 'HH:MM', 'HH:MM (tomorrow)', 'HH:MM (yesterday)', or
-    'YYYY-MM-DD HH:MM'."""
+    """A local clock time with this machine's UTC offset, and its day when it is not today: 'HH:MM (UTC)',
+    'HH:MM (tomorrow, UTC-05:00)', 'HH:MM (yesterday, UTC)', or 'YYYY-MM-DD HH:MM (UTC)'. The offset since 2026.11.18.1:
+    the servers run on UTC, so '19:38' read as 19:38 on a Mac in EST was five hours off."""
     when = dt.datetime.fromtimestamp(t)
     days = (when.date() - dt.datetime.fromtimestamp(time.time() if now is None else now).date()).days
-    hm = when.strftime("%H:%M")
-    return {0: hm, 1: f"{hm} (tomorrow)", -1: f"{hm} (yesterday)"}.get(days, when.strftime("%Y-%m-%d %H:%M"))
+    hm, z = when.strftime("%H:%M"), utc_offset(t)
+    return {0: f"{hm} ({z})", 1: f"{hm} (tomorrow, {z})", -1: f"{hm} (yesterday, {z})"}.get(
+        days, f"{when.strftime('%Y-%m-%d %H:%M')} ({z})")
+
+
+def iso(t: float) -> str:
+    """Epoch seconds as this machine's local time with its offset: 2026-11-17T19:38:17+00:00."""
+    return dt.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+
+
+def with_offset(stamp: str | None) -> str | None:
+    """A SLURM time (the controller's local time, no offset: 2026-11-17T19:38:17) with this machine's offset; other
+    values unchanged (None, 'N/A', a time that already has one)."""
+    if not isinstance(stamp, str) or len(stamp) != 19 or stamp[10:11] != "T":
+        return stamp
+    t = S.start_epoch(stamp)
+    return stamp if t is None else iso(t)
 
 
 def slurm_start(s: str | None) -> float | None:

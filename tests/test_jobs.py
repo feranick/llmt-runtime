@@ -15,6 +15,7 @@ from conftest import make_rt
 
 from llmt_runtime import Hooks
 from llmt_runtime import jobs as J
+from llmt_runtime import requests as R
 from llmt_runtime import slurm as S
 
 
@@ -278,7 +279,8 @@ def test_queued_with_reason_start_and_ahead(rt, slurm, monkeypatch):
     J.submit(rt, req, "c", {})
     st = J.job_states(rt, req, ["a", "b", "c"])
     assert st["a"]["state"] == "queued" and st["a"]["reason"] == "Priority"
-    assert st["a"]["expected_start"] == "2026-11-10T03:00:00"
+    assert st["a"]["expected_start"] == R.with_offset("2026-11-10T03:00:00")     # SLURM's time, with the offset
+    assert st["a"]["expected_start"].startswith("2026-11-10T03:00:00") and st["a"]["expected_start"][19] in "+-"
     assert (st["b"]["ahead"], st["a"]["ahead"], st["c"]["ahead"]) == (0, 1, 2)
 
 
@@ -303,7 +305,8 @@ def test_one_year_start_is_no_estimate(rt, slurm, monkeypatch):
     assert "no time limit ends" in nxt
     monkeypatch.setenv("FAKE_START", soon)                            # 299 days: still SLURM's own estimate
     st = J.job_states(rt, req, ["a"])["a"]
-    assert st["expected_start"] == soon and "expected_start_note" not in st and R.slurm_start(soon) is not None
+    assert st["expected_start"] == R.with_offset(soon) and "expected_start_note" not in st
+    assert R.slurm_start(st["expected_start"]) == R.slurm_start(soon) is not None
 
 
 def test_ahead_counts_per_node(rt, slurm, monkeypatch):

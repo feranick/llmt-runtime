@@ -61,12 +61,18 @@ def test_read_file_only_under_root(rt, tmp_path):
 
 def test_clock_and_slurm_start():
     now = time.mktime(time.strptime("2026-11-09T12:00:00", "%Y-%m-%dT%H:%M:%S"))
-    assert R.clock(now + 3600, now) == "13:00"
-    assert R.clock(now + 86400, now) == "12:00 (tomorrow)"
-    assert R.clock(now - 86400, now) == "12:00 (yesterday)"
-    assert R.clock(now + 3 * 86400, now) == "2026-11-12 12:00"
+    z = R.utc_offset(now)                     # the machine's offset (2026.11.18.1): 'UTC', 'UTC-05:00', ...
+    assert z == "UTC" or z.startswith(("UTC+", "UTC-"))
+    assert R.clock(now + 3600, now) == f"13:00 ({z})"
+    assert R.clock(now + 86400, now) == f"12:00 (tomorrow, {z})"
+    assert R.clock(now - 86400, now) == f"12:00 (yesterday, {z})"
+    assert R.clock(now + 3 * 86400, now) == f"2026-11-12 12:00 ({z})"
     assert R.slurm_start("2026-11-09T13:00:00") == now + 3600
     assert R.slurm_start("N/A") is None and R.slurm_start(None) is None
+    # with an offset: what the runtime reports since 2026.11.18.1, read back to the same instant
+    iso = R.with_offset("2026-11-09T13:00:00")
+    assert iso.startswith("2026-11-09T13:00:00") and len(iso) == 25 and R.slurm_start(iso) == now + 3600
+    assert R.iso(now + 3600) == iso and R.with_offset("N/A") == "N/A" and R.with_offset(iso) == iso
 
 
 def test_timing_slurm(tmp_path):
