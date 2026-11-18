@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.18.2 (the gate safe under set -e and re-registering its study, waited_jobs, dependency moves checked,
+Version: 2026.11.18.3 (run.after always a SLURM job, refused with a local executor or queue: false; 2026.11.18.2: the gate safe under set -e and re-registering its study, waited_jobs, dependency moves checked,
 job_end moves waiters back; 2026.11.18.1: run.after, cancel at='job_end', times with an offset)
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
@@ -310,7 +310,7 @@ def after_problems(rt, request: Path | None, name: str, study: dict, studies: di
     if not refs or not all(isinstance(x, str) and x.strip().strip("/") for x in refs):
         return ["run.after: '<request>/<study>', '<study>' (same request), or a list of them"]
     errs = []
-    # only a SLURM job can wait: a study of the local pool starts at once (2026.11.18.2; feat, lmpt and omct send
+    # only a SLURM job can wait: a study of the local pool starts at once (2026.11.18.3; feat, lmpt and omct send
     # short studies there)
     if S.kind(rt) != "slurm":
         errs.append(f"run.after needs SLURM: {rt.var('EXECUTOR')} is local on this machine, so the study would start "
