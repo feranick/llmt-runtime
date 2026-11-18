@@ -98,6 +98,7 @@ def slurm_version() -> tuple[str, int | None]:
 
 def make_runtime(root: Path, like: str | None) -> Runtime:
     os.environ[f"{PREFIX}_OUT"] = str(root)
+    os.environ[f"{PREFIX}_EXECUTOR"] = "slurm"        # run.after needs it (after_problems)
     if like:
         for k in ("SLURM_ARGS", "SLURM_NODE"):
             v = os.environ.get(f"{like.upper()}_{k}")

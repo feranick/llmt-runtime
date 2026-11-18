@@ -310,6 +310,14 @@ def after_problems(rt, request: Path | None, name: str, study: dict, studies: di
     if not refs or not all(isinstance(x, str) and x.strip().strip("/") for x in refs):
         return ["run.after: '<request>/<study>', '<study>' (same request), or a list of them"]
     errs = []
+    # only a SLURM job can wait: a study of the local pool starts at once (2026.11.18.2; feat, lmpt and omct send
+    # short studies there)
+    if S.kind(rt) != "slurm":
+        errs.append(f"run.after needs SLURM: {rt.var('EXECUTOR')} is local on this machine, so the study would start "
+                    f"at once (choose a machine with SLURM: run.host)")
+    elif S.queue_of(study) is False:
+        errs.append("run.after needs a SLURM job, and queue: false runs the study in the local pool at once: drop "
+                    "queue: false")
     if mode not in AFTER_MODES:
         errs.append("run.after_mode: 'any' (default: start when they end, however they end) or 'ok' (start only if "
                     "they all end ok; otherwise this study is cancelled)")

@@ -157,10 +157,13 @@ def queue_of(study: dict | None):
 
 
 def use_slurm(rt, study: dict, estimate_min: float | None) -> bool:
-    """Whether a study becomes a SLURM job: only with P_EXECUTOR=slurm; then "queue" decides if given, else the
+    """Whether a study becomes a SLURM job: only with P_EXECUTOR=slurm; then a study with run.after always (only a
+    SLURM job can wait: the local pool starts a study at once; 2026.11.18.2), else "queue" decides if given, else the
     estimate (none: SLURM)."""
     if kind(rt) != "slurm":
         return False
+    if run_of(study).get("after") is not None:
+        return True
     q = queue_of(study)
     if q is not None:
         return bool(q)

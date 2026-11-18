@@ -32,7 +32,8 @@ def finish(rt, req: Path, name: str, ok: bool = True, **keys) -> None:
     J.write_atomic(J.result_path(rt, req, name), json.dumps({"name": name, "ok": ok, **keys}))
 
 
-def test_validation(rt):
+def test_validation(rt, monkeypatch):
+    monkeypatch.setenv("TT_EXECUTOR", "slurm")
     a = request(rt, ["a"])
     assert J.after_problems(rt, None, "x", {"run": {"after": f"{a.name}/a"}}) == []
     assert J.after_problems(rt, None, "x", {"run": {"after": [f"{a.name}/a"], "after_mode": "ok"}}) == []
@@ -278,3 +279,24 @@ def test_selftest_reports_missing_slurm(tmp_path, monkeypatch, capsys):
     assert selftest.main(["slurm"]) == 1
     assert "FAIL  slurm" in capsys.readouterr().out
     assert selftest.main([]) == 2
+
+
+def test_run_after_needs_a_slurm_job(rt, monkeypatch):
+    """Only a SLURM job can wait: a study with run.after is always a SLURM job with P_EXECUTOR=slurm, whatever its
+    estimate, and is refused where the executor is local or with queue: false (feat's report, 2026-11-18: short
+    studies went to the local pool and started at once)."""
+    from llmt_runtime import slurm as S
+    a = request(rt, ["a"])
+    st = {"run": {"after": f"{a.name}/a"}}
+    monkeypatch.setenv("TT_EXECUTOR", "local")
+    assert "run.after needs SLURM: TT_EXECUTOR is local" in J.after_problems(rt, None, "x", st)[0]
+    assert S.use_slurm(rt, st, 0.01) is False
+    monkeypatch.setenv("TT_EXECUTOR", "slurm")
+    assert J.after_problems(rt, None, "x", st) == []
+    assert S.use_slurm(rt, st, 0.01) is True                       # under P_SLURM_MIN_MINUTES, still a job
+    assert S.use_slurm(rt, {}, 0.01) is False                      # (others as before)
+    assert S.use_slurm(rt, {"run": {"after": f"{a.name}/a", "queue": True}}, 0.01) is True
+    bad = J.after_problems(rt, None, "x", {"run": {"after": f"{a.name}/a", "queue": False}})
+    assert len(bad) == 1 and "drop queue: false" in bad[0]
+    assert "drop queue: false" in J.after_problems(rt, None, "x", {"run": {"after": f"{a.name}/a"}, "queue": False})[0]
+    assert J.after_problems(rt, None, "x", {"run": {"queue": False}}) == []    # no run.after: no opinion
