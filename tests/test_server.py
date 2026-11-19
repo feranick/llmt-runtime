@@ -218,3 +218,16 @@ def test_exit_does_not_hang_on_a_stopper(rt, tmp_path, monkeypatch):
         s.exit_soon("test", 0.0)
     time.sleep(1.0)
     assert exits == [0]
+
+
+def test_log_args_hook(stale_server, rt):
+    """omct logged a study's names and flags: hooks.log_args gives the line; the default stays name=value."""
+    s = stale_server[0]
+    assert s.summary("run_studies", {"studies": {"a": {}}}) == "studies={'a': {}}"
+    s.rt.hooks.log_args = lambda tool, kw: f"{tool}: " + ", ".join(sorted(kw["studies"]))
+    assert s.summary("run_studies", {"studies": {"b": {}, "a": {}}}) == "run_studies: a, b"
+    s.rt.hooks.log_args = lambda tool, kw: "x" * 2000
+    assert len(s.summary("t", {})) == 1003
+    s.rt.hooks.log_args = lambda tool, kw: kw["missing"]                # a broken hook: the default, and why
+    assert s.summary("t", {"a": 1}) == "a=1 (log_args: KeyError)"
+    s.rt.hooks.log_args = None

@@ -1,5 +1,5 @@
 """server.py — what every translator's MCP server shares: stale installs, the tool wrapper, the server's log.
-Version: 2026.11.09.6
+Version: 2026.11.19.1
 
     guard = Server(RT, api.__file__, busy=api.pool_busy, shutdown=api.shutdown_workers)
     @server.tool()
@@ -101,6 +101,17 @@ class Server:
         self.lock = threading.Lock()
         self.log_file = None
         self.log_path: str | None = None
+
+    def summary(self, tool: str, kwargs: dict) -> str:
+        """A call's arguments for the log: hooks.log_args (cut to 1000 characters), else name=value (300)."""
+        h = self.rt.hooks.log_args
+        if h:
+            try:
+                s = str(h(tool, dict(kwargs)))
+                return s if len(s) <= 1000 else s[:1000] + "..."
+            except Exception as exc:  # noqa: BLE001 (the log line must not break the call)
+                return f"{_summary(kwargs)} (log_args: {type(exc).__name__})"
+        return _summary(kwargs)
 
     # ---- stale
     def stale(self) -> str | None:
@@ -299,7 +310,7 @@ class Server:
             async def wrap(*args, **kwargs):
                 import anyio.to_thread   # (the MCP SDK's; the runtime itself is standard library only)
                 t0 = time.time()
-                self.log(f"call {fn.__name__} {_summary(kwargs)}")
+                self.log(f"call {fn.__name__} {self.summary(fn.__name__, kwargs)}")
                 refused = self.enter_call()
                 if refused:
                     self.log(f"refused {fn.__name__}: {refused}")

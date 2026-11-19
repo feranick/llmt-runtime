@@ -103,3 +103,13 @@ def test_until_within_deadline():
     assert R.until(10) - time.time() > 9
     with deadline(5):
         assert R.until(100) - time.time() < 2.1
+
+
+def test_within_call():
+    """until in seconds (lmpt's _within_call): the wait as given outside a call, within its deadline inside one."""
+    from llmt_runtime import slurm as S
+    assert R.within_call(30) == 30 and R.within_call(None) is None
+    with S.deadline(10):
+        assert 6 < R.within_call(30) <= 7 and 6 < R.within_call(None) <= 7 and R.within_call(2) <= 2
+    with S.deadline(1):
+        assert R.within_call(30) == 0.0

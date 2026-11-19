@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.18.4 (selftest: a runs 2 x --seconds; 2026.11.18.3: run.after always a SLURM job, refused with a local executor or queue: false; 2026.11.18.2: the gate safe under set -e and re-registering its study, waited_jobs, dependency moves checked,
+Version: 2026.11.19.1 (a job's node from squeue's ended rows and from job.json, kept when seen running; list_jobs hooks; queue_user_only; job.json time_min is the limit)
 job_end moves waiters back; 2026.11.18.1: run.after, cancel at='job_end', times with an offset)
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
@@ -221,7 +221,10 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
             return {"ok": False, "why": f"could not submit: {(p.stderr or p.stdout).strip()[:500]}"}
         job_id = out.splitlines()[-1].split(";")[0].split()[0]
     info = {"executor": "slurm", "job_id": job_id, "submitted": round(time.time(), 1), "procs": procs,
-            "time_min": S.time_need_min(rt, study), "slurm_time": t, "slurm_time_info": tinfo,
+            # time_min: the job's own limit (minutes; what the runs need when the limit is UNLIMITED), need_min: what
+            # the runs need (time_min before 2026.11.19.1; lmpt and omct wrote the limit through extra)
+            "time_min": int(t) if str(t).isdigit() else S.time_need_min(rt, study),
+            "need_min": S.time_need_min(rt, study), "slurm_time": t, "slurm_time_info": tinfo,
             "time_from": tinfo.get("time_from"), "timeout_s": tinfo.get("timeout_s", S.timeout_s(rt, study)),
             "mem": mplan["mem"], "mem_from": mplan["from"], "nodelist": nodelist, "run": S.run_of(study),
             "command": cmd, "translator": rt.version, "runtime": rt.runtime_version}
@@ -233,7 +236,7 @@ def submit(rt, request: Path, name: str, study: dict, estimate_min: float | None
         if mplan.get("total"):
             info["mem_total"] = mplan["total"]
     if estimate_min is not None:
-        info["estimate_min"] = round(float(estimate_min), 2)
+        info["estimate_min"] = float(estimate_min)      # as given (rounded to 0.01 before 2026.11.19.1)
     if after:
         info["after"] = list(after)
     if plan.get("targets"):
@@ -833,6 +836,13 @@ def classify_end(rt, acct: str | None, log_tail: str, has_log: bool = True, fold
             return "failed", (f"the job went to node {node} and left no job.log: that node cannot see {where} "
                               f"(its filesystem is not shared with this one); keep jobs on this node with "
                               f"{rt.var('SLURM_NODE')}=local")
+    if not has_log and not a and node:     # it ran (a node is known): not 'cancelled while queued'
+        if nodes is None:                  # the cluster's nodes unknown: cannot tell whether that node is this one
+            return "failed", (f"the job ran on node {node} but left no job.log here and no state in SLURM's "
+                              f"accounting: if {node} is not this machine, it cannot see the run folder (keep jobs on "
+                              f"this node with {rt.var('SLURM_NODE')}=local); else submit it again")
+        return "failed", (f"the job ran on node {node} but left no job.log and no state in SLURM's accounting; "
+                          "submit it again")
     if not has_log and not a:
         return "cancelled", ("left the queue without starting (no job.log): cancelled while queued (scancel), or "
                              "SLURM dropped it; submit it again if it was not cancelled on purpose")
@@ -875,6 +885,7 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
                       {"state": "unknown", "job_id": j["job_id"], "why": "SLURM did not answer (squeue); ask again later"})
         return out
     ended = {i: v["state"] for i, v in q.items() if v["state"] not in QUEUED and v["state"] not in ACTIVE}
+    ended_node = {i: q[i].get("node") for i in ended}
     q = {i: v for i, v in q.items() if i not in ended}      # ended jobs squeue still lists: gone
     gone = [j["job_id"] for n, j in jobs.items() if j["job_id"] not in q and not result_path(rt, request, n).is_file()]
     acct = sacct_rows(gone) if gone else {}
@@ -902,6 +913,7 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
                 rec = {"state": "running", "job_id": jid, "job_elapsed_min": st["elapsed_min"]}
                 if st.get("node"):
                     rec["node"] = st["node"]
+                    remember_node(request / n, jid, st["node"])
             out[n] = rec
         else:
             row = acct.get(jid, {})
@@ -912,21 +924,39 @@ def job_states(rt, request: Path, names: list[str], submitting_s: float = SUBMIT
             if a and a.upper().startswith(QUEUED):
                 out[n] = {"state": "queued", "job_id": jid, "reason": a}
                 continue
-            state, why = ended_state(rt, a, request / n / "job.log", job=j, node=row.get("node") or j.get("node"))
+            node = row.get("node") or ended_node.get(jid) or j.get("ran_on") or j.get("node")
+            state, why = ended_state(rt, a, request / n / "job.log", job=j, node=node)
             if state == "failed" and (request / n / rt.cancel_file).exists():
                 state, why = "cancelled", "cancelled with cancel(request) (it left the queue before running)"
             out[n] = {"state": state, "job_id": jid, "why": why}
     return out
 
 
-def queue_summary(rt) -> dict:
-    """{queue: {running, queued, cpus_in_use}} for this translator's jobs (names '<cli>:...', every user's), and
-    {machine: {cpus, cpus_allocated, cpus_idle}} of the nodes its jobs go to (sinfo %C)."""
+def remember_node(folder: Path, job_id: str, node: str) -> None:
+    """job.json's 'ran_on': the node squeue showed the job running on, kept for when it has left the queue (without
+    accounting, nothing else says where it ran: a job on a node that cannot see the run folder left no job.log here and
+    read as 'cancelled while queued'). Written once per node."""
+    try:
+        j = read_job(folder)
+        if j.get("job_id") == job_id and j.get("ran_on") != node:
+            j["ran_on"] = node
+            write_atomic(Path(folder) / "job.json", json.dumps(j))
+    except OSError:
+        pass
+
+
+def queue_summary(rt, user_only: bool | None = None) -> dict:
+    """{queue: {running, queued, cpus_in_use}} for this translator's jobs (names '<cli>:...'; every user's, or only
+    $USER's with user_only, default rt.queue_user_only), and {machine: {cpus, cpus_allocated, cpus_idle}} of the
+    nodes its jobs go to (sinfo %C)."""
     out = {"queue": {"running": 0, "queued": 0, "cpus_in_use": 0}, "machine": {}}
-    p = S.run(["squeue", "-h", "-o", "%i|%j|%T|%C"])
+    user = os.environ.get("USER", "") if (rt.queue_user_only if user_only is None else user_only) else ""
+    p = S.run(["squeue", "-h", "-o", "%i|%j|%T|%C|%u"])
     if p is not None and p.returncode == 0:
         for line in p.stdout.splitlines():
             f = line.strip().split("|")
+            if user and len(f) >= 5 and f[4] and f[4] != user:
+                continue
             if len(f) >= 4 and f[1].startswith(f"{rt.cli}:"):
                 if f[2] in ACTIVE:
                     out["queue"]["running"] += 1
@@ -966,7 +996,9 @@ def request_dirs(rt) -> list[Path]:
 def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
     """The jobs() tool: the newest requests with SLURM jobs, their studies' states (done ones with ok/why, running
     ones with hooks.running_progress), the translator's queue and the machine's CPUs. active: only requests with
-    queued or running studies. Within the call's deadline: a request not checked in time says so."""
+    queued or running studies (each request says 'active'). Within the call's deadline: a request not checked in time
+    says so. The translator's shape through hooks.jobs_states (the states), jobs_row (a study's row) and jobs_answer
+    (the whole answer)."""
     from .requests import clock
     out = []
     for d in request_dirs(rt):
@@ -984,11 +1016,15 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
             out.append({"request": str(d), "started": clock(meta.get("started", d.stat().st_mtime)),
                         "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
             continue
-        st = job_states(rt, d, names)
-        if active and not any(v["state"] in ("queued", "waiting", "running", "unknown") for v in st.values()):
+        st = rt.hooks.jobs_states(d, names, meta) if rt.hooks.jobs_states else job_states(rt, d, names)
+        live = any(v.get("state") in ("queued", "waiting", "running", "unknown") for v in st.values())
+        if active and not live:
             continue
         studies = {}
         for n, v in st.items():
+            if rt.hooks.jobs_row:
+                studies[n] = rt.hooks.jobs_row(d, n, dict(v), meta)
+                continue
             rec = dict(v)
             if v["state"] == "done":
                 try:
@@ -1004,8 +1040,10 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
                 except Exception:  # noqa: BLE001 (progress is extra)
                     pass
             studies[n] = rec
-        out.append({"request": str(d), "started": clock(meta.get("started", d.stat().st_mtime)), "studies": studies})
-    return {"translator": rt.version, "executor": S.kind(rt), "requests": out, **queue_summary(rt)}
+        out.append({"request": str(d), "started": clock(meta.get("started", d.stat().st_mtime)), "active": live,
+                    "studies": studies})
+    ans = {"translator": rt.version, "executor": S.kind(rt), "requests": out, **queue_summary(rt)}
+    return rt.hooks.jobs_answer(ans) if rt.hooks.jobs_answer else ans
 
 
 def stop_requested(folder: Path) -> bool:

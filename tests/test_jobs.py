@@ -211,6 +211,26 @@ def test_nodelist_pinned_and_dependency(rt, slurm, tmp_path, monkeypatch):
     assert "#SBATCH --nodelist=fake1" in (req / "a" / "job.sh").read_text()
     assert "--dependency=afterany:900:901" in info["command"] and info["after"] == ["900", "901"]
     assert info["estimate_min"] == 1.5
+    info = J.submit(rt, req, "a", {}, estimate_min=1.23456)
+    assert info["estimate_min"] == 1.23456                             # as given (lmpt, omct kept more digits)
+
+
+def test_job_json_time_min_is_the_limit(rt, slurm, monkeypatch):
+    """time_min: the job's own limit (lmpt and omct wrote it so through extra); need_min: what the runs need."""
+    req = request(rt)
+    info = J.submit(rt, req, "a", {})                                  # timeout 600 s: 20 min, limit = need
+    assert info["time_min"] == info["need_min"] == 20 and info["slurm_time"] == "20"
+    monkeypatch.setenv("TT_SLURM_TIME", "estimate")
+    monkeypatch.setenv("TT_TIMEOUT", "6000")
+    info = J.submit(rt, req, "a", {}, estimate_min=2.0)
+    assert info["time_min"] == 20 and info["need_min"] == 110 and info["time_from"] == "estimate"
+    info = J.submit(rt, req, "a", {"run": {"timeout_s": 600}}, estimate_min=2.0)
+    assert info["time_from"] == "study" and info["time_min"] == 20
+    monkeypatch.setenv("TT_SLURM_TIME", "max")
+    monkeypatch.setenv("FAKE_SINFO_PARTITIONS", "long*|infinite")
+    S.forget()
+    info = J.submit(rt, req, "a", {})
+    assert info["slurm_time"] == "UNLIMITED" and info["time_min"] == info["need_min"] == 110
 
 
 # ---- submission failures
@@ -416,6 +436,39 @@ def test_job_gone_to_another_node(rt, slurm, tmp_path, monkeypatch):
     assert st == "failed" and "without job.log (SLURM: NODE_FAIL)" in why
 
 
+def test_job_on_the_wrong_node_without_accounting(rt, slurm, tmp_path, monkeypatch):
+    """A job that ran on another node leaves no job.log here; without accounting it read 'cancelled while queued'. The
+    node squeue showed it running on is kept in job.json (ran_on), and an ended job squeue still lists gives its node."""
+    f = tmp_path / "nodes.txt"
+    f.write_text("NodeName=spark-5da5 CPUTot=20 RealMemory=1000 NodeHostName=spark-5da5\n"
+                 "NodeName=spark-0808 CPUTot=20 RealMemory=1000 NodeHostName=spark-0808\n")
+    monkeypatch.setenv("FAKE_SCONTROL_NODES", str(f))
+    monkeypatch.setattr(S.socket, "gethostname", lambda: "spark-5da5")
+    monkeypatch.setenv("FAKE_SACCT_FAIL", "1")
+    monkeypatch.setenv("FAKE_RUN_NODE", "spark-0808")
+    monkeypatch.setenv("TT_SLURM_NODE", "any")
+    monkeypatch.setenv("TT_MODE", "sleep:30")
+    req = request(rt)
+    jid = J.submit(rt, req, "a", {})["job_id"]
+    st = J.job_states(rt, req, ["a"])["a"]
+    assert st["state"] == "running" and st["node"] == "spark-0808" and J.read_job(req / "a")["ran_on"] == "spark-0808"
+    J.scancel([jid])
+    (req / "a" / "job.log").unlink(missing_ok=True)                   # it was written on spark-0808, not here
+    set_job(slurm, jid, vanished=True, sacct="")
+    st = J.job_states(rt, req, ["a"])["a"]
+    assert st["state"] == "failed" and "went to node spark-0808" in st["why"], st
+    # an ended job squeue still lists (MinJobAge) gives its node, even before any status call saw it running
+    monkeypatch.setenv("FAKE_MIN_JOB_AGE", "60")
+    req2 = request(rt)
+    jid2 = J.submit(rt, req2, "a", {})["job_id"]
+    J.scancel([jid2])
+    (req2 / "a" / "job.log").unlink(missing_ok=True)
+    set_job(slurm, jid2, final="FAILED")
+    assert "ran_on" not in J.read_job(req2 / "a")
+    st = J.job_states(rt, req2, ["a"])["a"]
+    assert st["state"] == "failed" and "spark-0808" in st["why"], st
+
+
 def test_classify_end_on_text(rt):
     """cfd-translator's final_state(acct, log text): the same rules on the text of job.log's end."""
     assert J.classify_end(rt, None, "", has_log=False)[0] == "cancelled"
@@ -515,9 +568,42 @@ def test_queue_summary_and_list_jobs(rt, slurm, monkeypatch):
     assert out["translator"] == rt.version and out["executor"] == "slurm"
     st = out["requests"][0]["studies"]
     assert st["a"]["state"] == "running" and st["a"]["stage"] == "solve" and st["b"]["state"] == "queued"
+    assert out["requests"][0]["active"] is True
     J.scancel([J.read_job(req / n)["job_id"] for n in ("a", "b")])
     assert J.list_jobs(rt, active=True)["requests"] == []
-    assert len(J.list_jobs(rt)["requests"]) == 1
+    assert len(J.list_jobs(rt)["requests"]) == 1 and J.list_jobs(rt)["requests"][0]["active"] is False
+
+
+def test_list_jobs_hooks(rt, slurm, monkeypatch):
+    """lmpt's and omct's jobs() shapes: their own states, rows and top-level keys through hooks."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    req = request(rt, ("a",))
+    J.submit(rt, req, "a", {})
+    seen = []
+    rt.hooks.jobs_states = lambda d, names, meta: seen.append(names) or {n: {"state": "queued", "stage": "x"} for n in names}
+    rt.hooks.jobs_row = lambda d, n, rec, meta: {"state": rec["state"], "mine": n}
+    rt.hooks.jobs_answer = lambda ans: {**ans, "executor": {"kind": "slurm"},
+                                        "requests": [dict(r, kind="benchmarks") for r in ans["requests"]]}
+    out = J.list_jobs(rt, active=True)
+    assert seen == [["a"]] and out["executor"] == {"kind": "slurm"} and "queue" in out and "machine" in out
+    assert out["requests"][0]["studies"] == {"a": {"state": "queued", "mine": "a"}}
+    assert out["requests"][0]["kind"] == "benchmarks" and out["requests"][0]["active"] is True
+
+
+def test_queue_summary_only_this_users_jobs(tmp_path, slurm, monkeypatch):
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    rt = make_rt(tmp_path)
+    req = request(rt, ("a", "b"))
+    monkeypatch.setenv("USER", "alice")
+    J.submit(rt, req, "a", {})
+    monkeypatch.setenv("USER", "bob")
+    J.submit(rt, req, "b", {})
+    assert J.queue_summary(rt)["queue"]["queued"] == 2                  # every user's, as before
+    assert J.queue_summary(rt, user_only=True)["queue"]["queued"] == 1
+    rt.queue_user_only = True                                          # cfdt, omct
+    assert J.queue_summary(rt)["queue"]["queued"] == 1
+    monkeypatch.delenv("USER")                                         # no $USER: every user's
+    assert J.queue_summary(rt)["queue"]["queued"] == 2
 
 
 def test_write_atomic(tmp_path):
@@ -633,7 +719,8 @@ def test_short_cpus_per_task_option_respected(tmp_path, slurm, monkeypatch):
 def test_lost_node_only_on_a_cluster(rt, slurm):
     req = request(rt)
     st, why = J.ended_state(rt, None, req / "a" / "job.log", job={}, node="localhost")   # one node: not 'lost'
-    assert "went to node" not in why and st == "cancelled"
+    assert "went to node" not in why and st == "failed" and "ran on node localhost" in why   # it ran: not cancelled
+    assert J.ended_state(rt, None, req / "a" / "job.log", job={})[0] == "cancelled"        # no node: never started
 
 
 def test_job_timeout_s(rt, slurm, tmp_path):

@@ -1,5 +1,5 @@
 """config.py — a translator's runtime: its settings prefix, CLI, package, version, SLURM kind and hooks.
-Version: 2026.11.09.1
+Version: 2026.11.19.1
 
 Configured per translator, never by globals: two translators in one process (tests, the router) each have their own
 Runtime. Environment variables keep their names: Runtime(prefix="FEAT") reads FEAT_SLURM_ARGS, FEAT_MAX_MEM, ...
@@ -37,6 +37,14 @@ class Hooks:
     result_file(request, name) -> Path  a finished study's result (default <request>/<name>/<name>.json)
     running_progress(study_folder, study) -> dict   progress keys of a running study for jobs()
     solver_left_s(study_folder, study) -> float     seconds before the running solve's own deadline (extend)
+    log_args(tool, kwargs) -> str       a tool call's arguments for the server log (default: name=value, 300 chars;
+                                        omct: the studies' names and flags)
+    jobs_states(request, names, meta) -> {name: rec}   the jobs() tool's study states for one request (default:
+                                        jobs.job_states; lmpt: its study_state, omct: its _collect)
+    jobs_row(request, name, rec, meta) -> dict   one study's row in jobs() (default: the state, ok/why when done,
+                                        running_progress when running)
+    jobs_answer(answer) -> dict         the whole jobs() answer, to add or reshape keys (lmpt's executor status,
+                                        omct's bench rows)
     """
     study_procs: Optional[Callable[[Study], Any]] = None
     procs: Optional[Callable[[Study], int]] = None
@@ -52,6 +60,10 @@ class Hooks:
     result_file: Optional[Callable[[Path, str], Path]] = None
     running_progress: Optional[Callable[[Path, Study], dict]] = None
     solver_left_s: Optional[Callable[[Path, Study], float]] = None
+    log_args: Optional[Callable[[str, dict], str]] = None
+    jobs_states: Optional[Callable[[Path, list, dict], dict]] = None
+    jobs_row: Optional[Callable[[Path, str, dict, dict], dict]] = None
+    jobs_answer: Optional[Callable[[dict], dict]] = None
 
 
 class _Bound:
@@ -87,6 +99,7 @@ class Runtime:
     cancel_file         the flag file cancel() writes in a study folder
     stale_period        s between two looks of the MCP server at the install (P_STALE_CHECK_S overrides)
     time_aliases        old P_SLURM_TIME words mapped to the common ones during a migration ({"estimate": "timeout"})
+    queue_user_only     queue_summary counts only $USER's jobs (cfdt, omct); default every user's with the prefix
     """
     prefix: str
     cli: str
@@ -102,6 +115,7 @@ class Runtime:
     cancel_file: str = "cancel"
     stale_period: float = 10.0
     time_aliases: dict = field(default_factory=dict)
+    queue_user_only: bool = False
     hooks: Hooks = field(default_factory=Hooks)
 
     def __post_init__(self):

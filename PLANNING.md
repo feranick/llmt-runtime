@@ -51,21 +51,21 @@ Below is what is left. The items are grouped by repo, and each says where it cam
 Shared code that translators still copy, or work around:
 
 - [ ] **`jobs.queued_note()` / `print_queued_note()`.** This is the message an interrupted CLI wait prints: the queued job ids, `scancel <ids>` and `<cli> cancel <request>`. cfdt (`cli.py`) and lmpt (`executor.py`) each have a copy. Move it to the runtime and use it in all four.
-- [ ] **Bounding waits to a call's deadline.** The runtime has `requests.until(wait)`. feat, cfdt, lmpt (`_within_call`) and omct (`status()`) each use their own copy. Make all four use `requests.until`. The README should also say that the call deadline only bounds SLURM commands: a translator's own wait loops must stop in time themselves.
+- [x] **Bounding waits to a call's deadline** (runtime: `requests.within_call` 2026.11.19.1; the translators swap their copies). The runtime has `requests.until(wait)`. feat, cfdt, lmpt (`_within_call`) and omct (`status()`) each use their own copy. Make all four use `requests.until`. The README should also say that the call deadline only bounds SLURM commands: a translator's own wait loops must stop in time themselves.
 - [ ] **A module-level `server.start_background(fn, ...)`.** It would use the serving `Server`, or a plain thread when nothing is serving. Today lmpt's `api.BACKGROUND` hook does this, set by `mcp_server.serve()`. Any translator that keeps work running after a call returns needs it.
-- [ ] **`Server`: a hook for the log's argument summary.** omct used to log a study's names and flags. The runtime logs `name=value`, cut to 300 characters.
+- [x] **`Server`: a hook for the log's argument summary** (`Hooks.log_args`, 2026.11.19.1). omct used to log a study's names and flags. The runtime logs `name=value`, cut to 300 characters.
 - [ ] **`Server`: the runtime folder and the exit call as settable attributes.** Today they are `Path(__file__)` and `os._exit`, and cfdt's tests patch `llmt_runtime.server.__file__` and `.threading` to replace them.
 - [ ] **`stale_reason`: look for `RELEASE.json` in every parent folder**, as lmpt's `find_release` did, not only two levels up. Today's layout (`releases/<name>/<repo>/<package>`) works; an install inside the release's venv would not.
 - [ ] **`testing.reset()`.** It should clear `slurm.forget()`, `jobs._PENDING` and `jobs._SBATCH_DOWN`. The translators' `conftest.py` files clear these private names themselves.
-- [ ] **`submit`'s `job.json` keys.** lmpt and omct pass their own values through `extra`:
+- [x] **`submit`'s `job.json` keys** (2026.11.19.1: `time_min` = the limit, `need_min`, `estimate_min` as given; lmpt and omct can drop their `extra` overrides). lmpt and omct pass their own values through `extra`:
   - `time_min`: the actual limit (the runtime writes the time the runs need).
   - `time_from: "study"` when `run.timeout_s` is set.
   - `estimate_min`, unrounded.
 
   Settle one meaning in the runtime and drop the overrides.
 - [ ] **A hook for what `cancel_request`'s flag file contains.** lmpt writes JSON `{by, at}` to `cancelled.json`; the runtime writes a bare timestamp.
-- [ ] **The shape of `list_jobs`.** lmpt and omct keep their own `jobs()` because the shapes differ: lmpt has `queue` and `machine` keys, and omct reports `_collect` per request. Give `list_jobs` hooks for the per-request row so all four can use it.
-- [ ] **`queue_summary`: count only this user's jobs.** cfdt and omct count only `$USER`'s jobs; the runtime counts every user's jobs carrying the translator's prefix. Add an option.
+- [x] **The shape of `list_jobs`** (hooks `jobs_states`, `jobs_row`, `jobs_answer`, 2026.11.19.1). lmpt and omct keep their own `jobs()` because the shapes differ: lmpt has `queue` and `machine` keys, and omct reports `_collect` per request. Give `list_jobs` hooks for the per-request row so all four can use it.
+- [x] **`queue_summary`: count only this user's jobs** (`Runtime.queue_user_only`, 2026.11.19.1). cfdt and omct count only `$USER`'s jobs; the runtime counts every user's jobs carrying the translator's prefix. Add an option.
 - [ ] **`node_cores`: the smallest or the largest node.** The runtime uses the smallest of the job's nodes; cfdt keeps the largest. Without SLURM, fall back to physical cores rather than logical CPUs (lmpt). It should also not ask `scontrol` when `P_EXECUTOR=local`.
 - [ ] **`caps` value types.** cfdt reports `caps` values as strings (`"procs": "20"`); the runtime reports numbers. Agree on numbers in the contract (`docs/EXECUTION.md`) and change cfdt's.
 - [ ] **Where `--nodelist` goes in `job.sh`.** It now comes after `--time`; cfdt and omct wrote it before. This is cosmetic, since sbatch does not care.
@@ -94,7 +94,11 @@ Shared code that translators still copy, or work around:
 - [x] **lmpt (2026.11.09.6):** the `Pool.__del__` noise at the end of the suite (a session fixture stops `api._POOL`), `$USER` defaulted in `conftest.py`, and the subprocess tests keep `PYTHONPATH`.
 - [ ] **lmpt, next version:** `extend`, as its own version, following the outline under "`extend` beyond feat" in section 2.
 - [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.
-- [ ] **omct:** nothing open beyond the shared items: the log summary hook and `list_jobs`.
+- [ ] **Translators onto runtime 2026.11.19.1** (floor `>=2026.11.19.1` where used):
+  - omct: `log_args` hook (studies' names and flags); `jobs()` through `list_jobs` with `jobs_states` (its `_collect`), `jobs_row`, `jobs_answer` (bench rows); `queue_user_only=True` and drop its own queue count; drop `job_extra`'s `time_min`/`estimate_min`; `requests.until` in `status()`.
+  - lmpt: `jobs()` through `list_jobs` with `jobs_states` (its `study_state`) and `jobs_answer` (`executor` status); drop `submit`'s `extra` time keys; `_within_call` = `requests.within_call`.
+  - cfdt: `queue_user_only=True` (its per-node counts stay its own).
+  - feat: `_until` = `requests.until`.
 - [ ] **build123d-translator (b3dt):** optional. It has no executor, but its MCP server could use `llmt_runtime.server.Server` for the same stale handling, tool wrapper and log.
 
 ## 4. llm-translators

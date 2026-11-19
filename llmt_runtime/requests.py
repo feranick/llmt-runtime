@@ -1,6 +1,6 @@
 """requests.py — request folders, request names chosen by the caller, the version a request ran with, files under the
 output root, and the time left as clock times.
-Version: 2026.11.18.1
+Version: 2026.11.19.1
 
     new_request(prefix, request_name)  <out>/<prefix>_<YYYYmmdd_HHMMSS>_<hex6>, or <out>/<request_name>
     check_request_name(name)    ('new' | 'repeat' | 'error', detail): a repeated name returns that request's status,
@@ -233,6 +233,15 @@ def until(wait: float, spare: float = 3.0) -> float:
     t = time.time() + max(0.0, float(wait))
     left = remaining()
     return t if left is None else min(t, time.time() + left - spare)
+
+
+def within_call(wait: float | None) -> float | None:
+    """A wait (s) shortened to end before the MCP call's deadline, `until`'s spare kept for the answer; outside a call
+    (CLI, tests, SLURM jobs) the wait as given (None: no limit). The seconds form of until (lmpt's _within_call)."""
+    from .slurm import remaining
+    if remaining() is None:
+        return wait
+    return max(0.0, until(1e9 if wait is None else float(wait)) - time.time())
 
 
 def write_json(path: Path, data) -> None:
