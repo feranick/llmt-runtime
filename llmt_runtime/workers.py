@@ -1,5 +1,5 @@
 """workers.py — worker processes end with the server that started them, and take their solver runs with them.
-Version: 2026.11.09.1
+Version: 2026.11.18.5
 
     watch_parent(ppid, name, term)  initializer of every worker pool and worker process: a daemon thread ends the worker
                                     (and the solver runs it started) when its parent is gone; term: SIGTERM does the same
@@ -10,6 +10,11 @@ Version: 2026.11.09.1
     stop_pool(pool), stop_executor(ex, terminate), stop_process(p), shutdown(*stoppers), run_bounded(fn, s)
                                     what a server calls before os._exit (which skips atexit); SIGTERM, then SIGKILL
                                     after a grace period, so a stop never hangs
+    make_pool(n, ...), make_executor(n, ...), make_process(target, ...)   multiprocessing pools, executors and processes
+                                    (spawn by default); where the OS refuses the semaphores or processes they need (an
+                                    MCP client's sandbox: the Gemini Mac app's Local MCP with a customized sandbox
+                                    raised PermissionError from SemLock, 2026.11.18), WorkersNotPermitted says what to
+                                    do instead of the bare OSError (2026.11.18.5)
 
 From fea-translator workers.py 2026.11.03.1 (carbonio, 2026.11.02: 7 orphaned spawn workers and a resource_tracker
 from three releases kept them 'in use' for llmt gc). A spawn worker holds both ends of its task queue, so it never sees
@@ -26,6 +31,8 @@ no time limit of its own).
 """
 from __future__ import annotations
 
+import errno
+import multiprocessing as mp
 import os
 import signal
 import threading
@@ -177,8 +184,16 @@ def stop_pool(pool, grace: float = 3.0) -> None:
     Pool.terminate() never waits on a worker that does not stop."""
     if pool is None:
         return
-    _end(list(getattr(pool, "_pool", None) or []), grace)
-    pool.terminate()
+    # Pool.terminate() first, in a thread: an idle worker holds the inqueue's read lock while it waits for a task, so
+    # killing the workers first (as before 2026.11.18.5) could leave the lock taken and terminate() waiting for it
+    # forever. Workers that do not stop within `grace` (inside a long native call) are then killed.
+    procs = list(getattr(pool, "_pool", None) or [])
+    t = threading.Thread(target=pool.terminate, daemon=True, name="llmt-pool-terminate")
+    t.start()
+    t.join(grace)
+    if t.is_alive():
+        _end(procs, 0.0)
+        t.join(grace)
 
 
 def stop_executor(ex, terminate: bool = True, grace: float = 3.0) -> None:
@@ -217,3 +232,74 @@ def run_bounded(fn: Callable[[], None], seconds: float) -> bool:
     t.start()
     t.join(seconds)
     return not t.is_alive()
+
+
+# ----------------------------------------------------------------------------- creating pools (2026.11.18.5)
+
+NOT_PERMITTED = ("worker processes are not permitted here (the MCP client's sandbox): give this app Full Access, or "
+                 "run through the router")
+_DENIED = (errno.EPERM, errno.EACCES, errno.ENOSYS)     # SemLock in a sandbox; ENOSYS: no POSIX semaphores at all
+
+
+class WorkersNotPermitted(RuntimeError):
+    """The OS refused what a worker pool needs (POSIX semaphores, new processes). Its text is NOT_PERMITTED, then the
+    OS's own error; .cause is that OSError."""
+
+    def __init__(self, cause: OSError | None = None):
+        self.cause = cause
+        super().__init__(NOT_PERMITTED + (f" ({type(cause).__name__}: {cause})" if cause is not None else ""))
+
+
+def not_permitted(exc: BaseException) -> WorkersNotPermitted | None:
+    """The WorkersNotPermitted for an error raised while creating or starting workers, or None when it is another
+    error (out of memory, too many open files ...), which is left as it is."""
+    if isinstance(exc, WorkersNotPermitted):
+        return exc
+    if isinstance(exc, OSError) and exc.errno in _DENIED:
+        return WorkersNotPermitted(exc)
+    return None
+
+
+def _context(context):
+    return mp.get_context(context) if isinstance(context, str) or context is None else context
+
+
+def make_pool(processes: int | None = None, *, context="spawn", **kw):
+    """multiprocessing.Pool(processes, **kw) of the given start method (or context): what the translators' run and
+    auxiliary pools were (`mp.get_context("spawn").Pool(n, maxtasksperchild=..., initializer=watch_parent, ...)`).
+    Raises WorkersNotPermitted where the sandbox refuses it."""
+    try:
+        return _context(context).Pool(processes, **kw)
+    except OSError as exc:
+        e = not_permitted(exc)
+        if e is None:
+            raise
+        raise e from exc
+
+
+def make_executor(max_workers: int | None = None, *, context="spawn", **kw):
+    """concurrent.futures.ProcessPoolExecutor(max_workers, mp_context=<context>, **kw); WorkersNotPermitted where the
+    sandbox refuses it (its queues need semaphores already when it is created)."""
+    from concurrent.futures import ProcessPoolExecutor
+    try:
+        return ProcessPoolExecutor(max_workers=max_workers, mp_context=_context(context), **kw)
+    except OSError as exc:
+        e = not_permitted(exc)
+        if e is None:
+            raise
+        raise e from exc
+
+
+def make_process(target: Callable, args: tuple = (), *, context="spawn", start: bool = True, **kw):
+    """A multiprocessing.Process(target, args, **kw), started unless start=False; WorkersNotPermitted where the sandbox
+    refuses it."""
+    try:
+        p = _context(context).Process(target=target, args=args, **kw)
+        if start:
+            p.start()
+        return p
+    except OSError as exc:
+        e = not_permitted(exc)
+        if e is None:
+            raise
+        raise e from exc

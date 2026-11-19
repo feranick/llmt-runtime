@@ -88,6 +88,7 @@ Since 2026-11-09 this translator runs on **llmt-runtime**, the package that hold
 - **`clock()` ends with the UTC offset** (2026.11.18.1): `'19:38 (UTC)'`, `'07:15 (tomorrow, UTC-05:00)'`; `expected_start` carries the offset. Tests comparing exact clock strings compare with `RT.requests.clock()` of the same time.
 - **Only SLURM jobs wait** (2026.11.18.3; floor `llmt-runtime>=2026.11.18.3`): a study with `run.after` is always a SLURM job with `P_EXECUTOR=slurm` (`use_slurm`), and `after_problems` refuses it where the executor is local or with `queue: false`. A translator that keeps its own study state should report a queued job with `run_after` through `RT.jobs.waiting_detail` (state `waiting`), as lmpt does.
 - **`set -e`** in `P_JOB_SETUP` or a translator's script lines is safe with the gate (2026.11.18.2).
+- **Worker pools through `workers.make_pool` / `make_executor` / `make_process`** (2026.11.18.5): a sandbox that refuses them (the Gemini Mac app's Local MCP with a customized sandbox) then gives a clear error instead of `PermissionError` from `SemLock`. `stop_pool` no longer hangs on idle workers.
 - **`llmt selftest slurm`** (2026.11.18.2): checks a machine's SLURM for all of the above, with no translator.
 
 ---
