@@ -95,7 +95,7 @@ Shared code that translators still copy, or work around:
 - [ ] **lmpt, next version:** `extend`, as its own version, following the outline under "`extend` beyond feat" in section 2.
 - [ ] **lmpt and omct:** nothing to change for the per-node queue position: they get it from runtime 2026.11.09.7 through `job_states` once it is pinned.
 - [ ] **Translators onto runtime 2026.11.19.1** (floor `>=2026.11.19.1` where used):
-  - omct: `log_args` hook (studies' names and flags); `jobs()` through `list_jobs` with `jobs_states` (its `_collect`), `jobs_row`, `jobs_answer` (bench rows); `queue_user_only=True` and drop its own queue count; drop `job_extra`'s `time_min`/`estimate_min`; `requests.until` in `status()`.
+  - omct: done in 2026.11.19.3 (`log_args`, `queue_user_only`, the time fields, `requests.until`), except `jobs()`: move it onto `list_jobs(RT, ..., all_requests=True)` with `jobs_states` (its `_collect`), `jobs_row` and `jobs_answer` (bench rows), floor `>=2026.11.19.2`.
   - lmpt: `jobs()` through `list_jobs` with `jobs_states` (its `study_state`) and `jobs_answer` (`executor` status); drop `submit`'s `extra` time keys; `_within_call` = `requests.within_call`.
   - cfdt: `queue_user_only=True` (its per-node counts stay its own).
   - feat: `_until` = `requests.until`.

@@ -1,5 +1,5 @@
 """jobs.py — one SLURM job per study: job.sh, submission, states read from the files and the queue, cancel, extend.
-Version: 2026.11.19.1 (a job's node from squeue's ended rows and from job.json, kept when seen running; list_jobs hooks; queue_user_only; job.json time_min is the limit)
+Version: 2026.11.19.2 (list_jobs(all_requests=True): local studies and requests too)
 job_end moves waiters back; 2026.11.18.1: run.after, cancel at='job_end', times with an offset)
 
     job_script / submit         <request>/<name>/job.sh (a complete script: `sbatch job.sh` reruns the study) and
@@ -993,12 +993,14 @@ def request_dirs(rt) -> list[Path]:
                   key=lambda d: d.stat().st_mtime, reverse=True)
 
 
-def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
+def list_jobs(rt, limit: int = 20, active: bool = False, all_requests: bool = False) -> dict:
     """The jobs() tool: the newest requests with SLURM jobs, their studies' states (done ones with ok/why, running
     ones with hooks.running_progress), the translator's queue and the machine's CPUs. active: only requests with
     queued or running studies (each request says 'active'). Within the call's deadline: a request not checked in time
     says so. The translator's shape through hooks.jobs_states (the states), jobs_row (a study's row) and jobs_answer
-    (the whole answer)."""
+    (the whole answer). all_requests: every request and all of its studies (meta's names), local ones too (omct runs
+    most studies in the local pool); hooks.jobs_states then gets every name, and without it a study with no job.json
+    reads 'done' with its result, else 'local'."""
     from .requests import clock
     out = []
     for d in request_dirs(rt):
@@ -1008,7 +1010,10 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
             meta = json.loads((d / "request.json").read_text())
         except (OSError, ValueError):
             continue
-        names = [n for n in meta.get("slurm", []) or meta.get("names", []) if (d / n / "job.json").is_file()]
+        if all_requests:
+            names = list(meta.get("names", []))
+        else:
+            names = [n for n in meta.get("slurm", []) or meta.get("names", []) if (d / n / "job.json").is_file()]
         if not names:
             continue
         left = S.remaining()
@@ -1016,7 +1021,13 @@ def list_jobs(rt, limit: int = 20, active: bool = False) -> dict:
             out.append({"request": str(d), "started": clock(meta.get("started", d.stat().st_mtime)),
                         "note": "not checked: SLURM was slow and the call ran out of time; ask again"})
             continue
-        st = rt.hooks.jobs_states(d, names, meta) if rt.hooks.jobs_states else job_states(rt, d, names)
+        if rt.hooks.jobs_states:
+            st = rt.hooks.jobs_states(d, names, meta)
+        else:
+            queued = [n for n in names if (d / n / "job.json").is_file()]
+            st = job_states(rt, d, queued) if queued else {}
+            st = {n: st.get(n) or {"state": "done" if result_path(rt, d, n).is_file() else "local", "job_id": None}
+                  for n in names}
         live = any(v.get("state") in ("queued", "waiting", "running", "unknown") for v in st.values())
         if active and not live:
             continue

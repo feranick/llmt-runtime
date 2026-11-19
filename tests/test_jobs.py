@@ -729,3 +729,24 @@ def test_job_timeout_s(rt, slurm, tmp_path):
     (req / "a").mkdir(exist_ok=True)
     (req / "a" / "job.json").write_text(json.dumps({"timeout_s": 300}))
     assert J.job_timeout_s(req / "a", 900) == 300
+
+
+def test_list_jobs_all_requests(rt, slurm, monkeypatch):
+    """omct: most studies run in the local pool; all_requests lists them (and requests with no SLURM job at all)."""
+    monkeypatch.setenv("FAKE_SBATCH_PENDING", "1")
+    local = request(rt, ("l",), slurm=False)
+    (local / "l").mkdir()
+    (local / "l" / "l.json").write_text('{"ok": true}')
+    mixed = request(rt, ("s", "m"))
+    J.submit(rt, mixed, "s", {})
+    assert [r["request"] for r in J.list_jobs(rt)["requests"]] == [str(mixed)]          # default: as before
+    out = J.list_jobs(rt, all_requests=True)
+    rows = {r["request"]: r["studies"] for r in out["requests"]}
+    assert set(rows) == {str(local), str(mixed)}
+    assert rows[str(local)]["l"]["state"] == "done" and rows[str(local)]["l"]["ok"] is True
+    assert rows[str(mixed)]["s"]["state"] == "queued" and rows[str(mixed)]["m"]["state"] == "local"
+    assert [r["request"] for r in J.list_jobs(rt, active=True, all_requests=True)["requests"]] == [str(mixed)]
+    seen = []
+    rt.hooks.jobs_states = lambda d, names, meta: seen.append(sorted(names)) or {n: {"state": "running"} for n in names}
+    J.list_jobs(rt, all_requests=True)
+    assert sorted(seen) == [["l"], ["m", "s"]]                         # the hook gets every name
